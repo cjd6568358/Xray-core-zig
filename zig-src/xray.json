@@ -1,0 +1,85 @@
+{
+  "log": {
+    "loglevel": "info",
+    "access": "/tmp/xrayz-access.log"
+  },
+  "inbounds": [
+    {
+      "tag": "inbound-19001",
+      "listen": "0.0.0.0",
+      "port": 19001,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "de53e864-8530-4212-a3d7-c31e60b62e91",
+            "email": "pb8lpgli",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/free",
+          "host": "",
+          "headers": {
+            "Host": "ltetp.tv189.com"
+          }
+        }
+      },
+      "sniffing": {
+        "enabled": false,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic",
+          "fakedns"
+        ]
+      }
+    },
+    {
+      "tag": "kcp-vmess",
+      "listen": "0.0.0.0",
+      "port": 19002,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "de53e864-8530-4212-a3d7-c31e60b62e91",
+            "alterId": 0,
+            "email": "pb8lpgli"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "kcp",
+        "security": "none",
+        "kcpSettings": {
+          "mtu": 1250,
+          "tti": 20,
+          "uplinkCapacity": 20,
+          "downlinkCapacity": 20,
+          "congestion": false,
+          "readBufferSize": 4,
+          "writeBufferSize": 4
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "settings": {
+        "finalRules": [
+          {
+            "action": "allow"
+          }
+        ]
+      }
+    }
+  ]
+}

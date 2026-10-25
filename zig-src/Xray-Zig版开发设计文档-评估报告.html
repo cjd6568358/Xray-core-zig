@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Xray-Zig 版开发设计文档 · 评估报告</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { min-height: 100%; }
+body {
+  position: relative;
+  font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", "Noto Sans SC", sans-serif;
+  color: #1f2d3d;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 40px 24px;
+  background: linear-gradient(160deg, #f8fafc 0%, #ffffff 45%, #cfe0f5 100%);
+  min-height: 100vh;
+}
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 45% 35% at 12% 8%, rgba(255,255,255,0.55) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 30% at 88% 90%, rgba(255,255,255,0.45) 0%, transparent 55%);
+}
+body > * { position: relative; z-index: 1; }
+.title {
+  position: relative;
+  overflow: hidden;
+  padding: 48px 40px;
+  text-align: center;
+  background: linear-gradient(135deg, #1e3a5f 0%, #3b82f6 50%, #4f8ef7 100%);
+  color: #ffffff;
+  border-radius: 16px;
+  margin-bottom: 24px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.12);
+}
+.title::before {
+  content: '';
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 70% 55% at 18% 82%, rgba(255,255,255,0.12) 0%, transparent 60%),
+    radial-gradient(ellipse 55% 40% at 82% 18%, rgba(255,255,255,0.08) 0%, transparent 55%);
+  pointer-events: none;
+}
+.title h1 { font-size: 26px; font-weight: 700; letter-spacing: 0.5px; }
+.title .sub { margin-top: 10px; font-size: 14px; opacity: 0.92; }
+.title .meta { margin-top: 18px; font-size: 12.5px; opacity: 0.85; line-height: 1.9; }
+.card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 26px 28px;
+  margin-bottom: 22px;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.05);
+}
+h2 {
+  font-size: 19px;
+  color: #1e3a5f;
+  margin-bottom: 14px;
+  padding-left: 12px;
+  border-left: 4px solid #3b82f6;
+  line-height: 1.4;
+}
+h3 { font-size: 15.5px; color: #27496d; margin: 18px 0 8px; }
+p { margin-bottom: 10px; font-size: 14px; }
+table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+th {
+  background: #1e3a5f;
+  color: #ffffff;
+  padding: 9px 10px;
+  text-align: left;
+  font-weight: 600;
+  white-space: nowrap;
+}
+td { padding: 8px 10px; border-bottom: 1px solid #e8eef5; vertical-align: top; }
+tr:nth-child(even) td { background: #f6f9fd; }
+code, .mono {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 12px;
+  background: #eef2f7;
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: #b03060;
+}
+.badge {
+  display: inline-block;
+  padding: 1px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.b-ok { background: #dcfce7; color: #15803d; }
+.b-p0 { background: #fee2e2; color: #b91c1c; }
+.b-p1 { background: #ffedd5; color: #c2410c; }
+.b-p2 { background: #fef9c3; color: #a16207; }
+.score-grid { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0 6px; }
+.score-item {
+  flex: 1 1 150px;
+  background: linear-gradient(160deg, #f4f8fe, #eaf1fb);
+  border: 1px solid #d6e3f5;
+  border-radius: 12px;
+  padding: 14px 12px;
+  text-align: center;
+}
+.score-item .num { font-size: 24px; font-weight: 700; color: #1e3a5f; }
+.score-item .lbl { font-size: 12px; color: #5b6b7f; margin-top: 2px; }
+.score-total {
+  text-align: center;
+  font-size: 15px;
+  color: #33475e;
+  margin-top: 10px;
+}
+.score-total strong { color: #1d4ed8; font-size: 20px; }
+.verdict {
+  background: linear-gradient(135deg, #eff6ff, #dbeafe);
+  border: 1px solid #bfdbfe;
+  border-radius: 12px;
+  padding: 16px 20px;
+  font-size: 14.5px;
+  color: #1e3a5f;
+  margin-top: 12px;
+}
+ul, ol { padding-left: 22px; margin-bottom: 10px; }
+li { font-size: 14px; margin-bottom: 7px; }
+.issue {
+  border: 1px solid #e2e8f0;
+  border-left-width: 5px;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+  background: #ffffff;
+}
+.issue.p0 { border-left-color: #dc2626; }
+.issue.p1 { border-left-color: #ea580c; }
+.issue.p2 { border-left-color: #eab308; }
+.issue h4 { font-size: 14.5px; margin-bottom: 6px; color: #1f2d3d; }
+.issue .where { font-size: 12.5px; color: #64748b; margin-bottom: 8px; }
+.footer {
+  text-align: center;
+  font-size: 12px;
+  color: #7c8da0;
+  padding: 18px 0 8px;
+}
+.note { font-size: 12.5px; color: #64748b; }
+</style>
+</head>
+<body>
+
+<div class="title">
+  <h1>《Xray-core Zig 版开发设计文档》评估报告</h1>
+  <div class="sub">第三方视角 · 源码核验 · 风险分级</div>
+  <div class="meta">
+    评估日期：2026-10-22<br>
+    评估对象：Xray-Zig版开发设计文档.html（约 1050 行）<br>
+    核验基线：本仓库 Go 源码 Xray-core-zig @ 1b1647cd（v26.10.21）<br>
+    交付资产检查：xray.json / gen_golden_vectors.go / vmess_aead.txt（均在位）
+  </div>
+</div>
+
+<div class="card">
+  <h2>一、评估结论</h2>
+  <p>本报告以「文档声明逐条对照上游 Go 源码」的方式核验设计文档的技术准确性，并评估其完整性、可实施性与工程纪律。<strong>总评 8.7 / 10</strong>：这是一份罕见的、工程纪律极强的重写类设计文档，可作为实施依据直接移交；但存在 3 个 P0 级接缝缺陷，建议修订后再交付实施团队。</p>
+  <div class="score-grid">
+    <div class="score-item"><div class="num">9.0</div><div class="lbl">技术准确性<br>（抽查 22 项全部属实）</div></div>
+    <div class="score-item"><div class="num">8.5</div><div class="lbl">完整性<br>（范围/契约/测试闭环）</div></div>
+    <div class="score-item"><div class="num">8.0</div><div class="lbl">可实施性<br>（3 个 P0 接缝未定义）</div></div>
+    <div class="score-item"><div class="num">9.5</div><div class="lbl">工程纪律<br>（偏差显式化、硬门禁）</div></div>
+  </div>
+  <div class="score-total">综合得分 <strong>8.7</strong> / 10</div>
+  <div class="verdict">
+    一句话结论：文档在<b>技术事实层面几乎无可挑剔</b>（22 项抽查全过、引用行号基本准确），主要短板不在「写错了什么」，而在「<b>少定义了三个关键接缝</b>」（KCP 超时机制、预读超读保留、数据面分块体黄金向量），以及验收缺资源量化维度。
+  </div>
+</div>
+
+<div class="card">
+  <h2>二、评估方法</h2>
+  <ol>
+    <li><strong>通读全文</strong>：完整阅读设计文档（目标、范围、架构、协议契约、配置语义、测试、里程碑等章节）。</li>
+    <li><strong>源码级核验</strong>：对文档中 22 项关键技术声明（协议线格式、密码学流程、KCP/WS/freedom 行为、默认值、退出码等），逐条打开本仓库对应 Go 源码文件比对，而非仅凭经验判断。</li>
+    <li><strong>资产核验</strong>：检查文档承诺交付的三份资产文件是否在位、内容是否自洽（黄金向量生成器与向量文件）。</li>
+    <li><strong>接缝审查</strong>：从「实施者视角」检查各章节之间的衔接处（线程模型 × 传输实现、预读 × 流接口、测试策略 × 可测试性设计），这部分是文档的薄弱区。</li>
+  </ol>
+  <p class="note">核验覆盖文件：proxy/vless/{encoding/encoding.go, validator.go, inbound/inbound.go}、proxy/vmess/aead/{encrypt.go, kdf.go, consts.go}、transport/internet/websocket/{hub.go, config.go}、transport/internet/kcp/{segment.go, config.go, connection.go, receiving.go, config.proto}、proxy/freedom/freedom.go、features/policy/policy.go、infra/conf/{log.go, transport_method.go, xray.go}、transport/internet/system_dialer.go、main/run.go、zig-src/*。</p>
+</div>
+
+<div class="card">
+  <h2>三、技术准确性核验（22 项抽查，全部属实）</h2>
+  <p>以下每一条声明均已打开本仓库对应源码比对。<span class="badge b-ok">属实</span> 表示与上游实现一致；连文档引用的具体行号也一并抽查。</p>
+  <table>
+    <tr><th>#</th><th>文档声明</th><th>结论</th><th>上游出处</th></tr>
+    <tr><td>1</td><td>VLESS 请求头线格式：版本 0 / UUID 16B / addons 长度 / command / <b>端口在前</b> / 地址类型 1-2-3</td><td><span class="badge b-ok">属实</span></td><td><code>proxy/vless/encoding/encoding.go:30-132</code></td></tr>
+    <tr><td>2</td><td>VLESS 响应头固定 2 字节 <code>{0x00,0x00}</code></td><td><span class="badge b-ok">属实</span></td><td><code>encoding.go:134-152</code> + <code>inbound.go:609-614</code></td></tr>
+    <tr><td>3</td><td>用户查找前 UUID 第 6、7 字节清零（fork 路由特性）；原始 6/7 字节取 16bit 路由端口存入 session</td><td><span class="badge b-ok">属实</span></td><td><code>proxy/vless/validator.go:21-25</code>、<code>inbound.go:536</code></td></tr>
+    <tr><td>4</td><td>VMess AEAD 请求头 16+18+8+N+16；长度/载荷双段 GCM，AAD=AuthID</td><td><span class="badge b-ok">属实</span></td><td><code>proxy/vmess/aead/encrypt.go:14-61</code></td></tr>
+    <tr><td>5</td><td>头载荷布局：version / bodyIV / bodyKey / respHeader / option / <code>paddingLen&lt;&lt;4|security</code> / command / 端口+地址 / padding / FNV-1a 尾</td><td><span class="badge b-ok">属实</span></td><td><code>encoding/client.go</code>（经生成器复现）</td></tr>
+    <tr><td>6</td><td>KDF 闭包嵌套 HMAC 构造、9 个盐常量全部列入实现</td><td><span class="badge b-ok">属实</span></td><td><code>aead/kdf.go</code>、<code>consts.go</code>（生成器逐字复制）</td></tr>
+    <tr><td>7</td><td>响应头：SHA256 派生响应密钥 + 内层 CFB 4B + 外层 18B+AEAD，共 38B</td><td><span class="badge b-ok">属实</span></td><td><code>encoding/server.go</code>（向量 SELF_CHECK PASSED）</td></tr>
+    <tr><td>8</td><td>ChaCha20-Poly1305 密钥 = <code>MD5(bodyKey) ‖ MD5(MD5(bodyKey))</code> 32B</td><td><span class="badge b-ok">属实</span></td><td><code>aead/encrypt.go</code> newBit</td></tr>
+    <tr><td>9</td><td>WS 握手：Host/Path 精确匹配、4s 超时、8192 头上限、CheckOrigin 恒 true、Sec-WebSocket-Protocol 0-RTT 早期数据</td><td><span class="badge b-ok">属实</span></td><td><code>websocket/hub.go:41-76</code></td></tr>
+    <tr><td>10</td><td>WS path 规范化：空→"/"、无前导斜杠补"/"</td><td><span class="badge b-ok">属实</span></td><td><code>websocket/config.go:11-19</code></td></tr>
+    <tr><td>11</td><td><code>headers.host</code> 大小写不敏感迁移进独立 host 字段并打弃用警告</td><td><span class="badge b-ok">属实</span></td><td><code>infra/conf/transport_method.go:630-646</code></td></tr>
+    <tr><td>12</td><td>KCP segment 三种形态 18B/17B/16B、全大端</td><td><span class="badge b-ok">属实</span></td><td><code>kcp/segment.go</code></td></tr>
+    <tr><td>13</td><td>KCP 默认值：mtu 1350 / tti 50 / 上下行 5 / 20 / cwnd 1 / 发送窗 2MiB</td><td><span class="badge b-ok">属实</span></td><td><code>kcp/config.go:28-38</code></td></tr>
+    <tr><td>14</td><td>InFlight = 容量×1MiB/Mtu/(1000/Tti)，下限 8；本配置 ≈335 段；SendingBuffer = 窗口/Mtu</td><td><span class="badge b-ok">属实</span></td><td><code>kcp/config.go:8-26</code></td></tr>
+    <tr><td>15</td><td>AckSegment 序号上限 <code>min((mss−17)/4, 128)</code></td><td><span class="badge b-ok">属实</span></td><td><code>kcp/receiving.go:96</code>、<code>segment.go:138</code></td></tr>
+    <tr><td>16</td><td>fork 已删除 congestion / readBufferSize / writeBufferSize / header / seed / crypt</td><td><span class="badge b-ok">属实</span></td><td><code>kcp/config.proto</code> 仅存 6 字段</td></tr>
+    <tr><td>17</td><td>finalRules 求值序、vless/vmess 入站内置私网屏蔽、block 30–90s 随机延迟、拨号后按实际 IP 复检</td><td><span class="badge b-ok">属实</span></td><td><code>proxy/freedom/freedom.go:160-360</code></td></tr>
+    <tr><td>18</td><td>策略超时：握手 60s / 空闲 300s / 上行 1s / 下行 1s</td><td><span class="badge b-ok">属实</span></td><td><code>features/policy/policy.go:125-142</code></td></tr>
+    <tr><td>19</td><td>loglevel warning→2；access=/dev/null 走文件分支真实打开</td><td><span class="badge b-ok">属实</span></td><td><code>infra/conf/log.go:10-45</code></td></tr>
+    <tr><td>20</td><td>配置错误 exit(23)；-test 打印 <code>Configuration OK.</code></td><td><span class="badge b-ok">属实</span></td><td><code>main/run.go:87-91</code></td></tr>
+    <tr><td>21</td><td>拨号 16s 超时、Chrome 风格 keepalive 45/45、指数退避 5×100ms</td><td><span class="badge b-ok">属实</span></td><td><code>transport/internet/system_dialer.go:104-131</code>、<code>freedom.go:293</code></td></tr>
+    <tr><td>22</td><td>黄金向量：8 组 KDF + 124B 密封头 + 38B 响应头；生成器与同版本上游逐字对应、自校验通过</td><td><span class="badge b-ok">属实</span></td><td><code>zig-src/tools/gen_golden_vectors.go</code>、<code>zig-src/tests/golden/vmess_aead.txt</code></td></tr>
+  </table>
+  <p class="note">说明：第 22 项中生成器将 <code>time.Now()</code>/<code>rand</code> 固化为定值以保证可复现，与上游逐字同构；KCP 30s 空闲关闭、ReadyToClose 15s 升级（connection.go:615-635）、VMess <code>NoTerminationSignal</code> 账号开关（account.go）亦属实，并入上表不再单列。</p>
+</div>
+
+<div class="card">
+  <h2>四、突出优点</h2>
+  <h3>4.1 规范锚定纪律成熟</h3>
+  <p>文档确立了「Go 源码即 single source of truth + 裁决顺序 + 禁止合理化改写」的总纪律。这是重写类项目不出偏差的生命线，而且它被写进了正文而非仅作口号——每个协议章节都以「对照上游哪一行」的方式展开。</p>
+  <h3>4.2 范围控制精准</h3>
+  <p>功能范围锚定到具体配置文件（xray.json）逐字段解读，不泛化到「完整 Xray」；「不实现清单」附带「触发时行为」，并明确「不支持即显式报错、仅遗留字段静默容忍」的边界原则——边界清晰，实施者没有发挥空间，也就没有偏差空间。</p>
+  <h3>4.3 密码学方法论正确</h3>
+  <p>KDF 这种闭包嵌套构造采用「先跑向量生成器、再向量驱动实现」的工作顺序；生成器与仓库同版本源码逐字对应且带自校验（AuthID CRC / 密封头往返 / 响应头 AEAD+CFB 往返全部 PASSED）。字节级正确性被向量锁定，而不是留给实现者「照着论文写」。</p>
+  <h3>4.4 测试即门禁</h3>
+  <p>上游测试逐个映射到函数名形成移植映射表，并禁止「先跑通再补测试」——测试与实现同步产生，避免重写项目最常见的「测试债务」。</p>
+  <h3>4.5 有意偏差显式化（D1–D4）</h3>
+  <p>每项与上游的有意偏差都有理由、有风险、有回归条件，并经业主确认。这种「偏差清单」文化在重写项目中极其重要——它把隐式漂移变成显式决策。</p>
+  <h3>4.6 扩展机制清晰</h3>
+  <p>用 comptime 注册表替代 Go <code>init()</code> 副作用导入协议，配三条防腐化纪律；数据面 walkthrough 细化到步骤级，可直接作为实施对照表。</p>
+</div>
+
+<div class="card">
+  <h2>五、问题清单（按严重级分级）</h2>
+  <p>以下问题从「实施者视角」审查得出——即：一名工程师只拿着这份文档开工，会在哪里卡住或做错。</p>
+
+  <h3><span class="badge b-p0">P0</span> 建议修订后再交付实施团队（3 项）</h3>
+
+  <div class="issue p0">
+    <h4>P0-1　KCP Stream 的超时机制缺口（线程模型 × 传输实现的接缝）</h4>
+    <div class="where">涉及章节：§3.4 线程与内存预算 / §5.10 KCP 契约</div>
+    <p>文档称「空闲与超时全部用 <code>SO_RCVTIMEO</code>/<code>SO_SNDTIMEO</code> + 每操作刷新 deadline 实现，不需要独立定时器线程」——但 KCP 会话跑在 <b>UDP 收包线程 + 有界队列</b>之上，<b>socket 超时对它无效</b>。VLESS/VMess 的 60s 握手 deadline、300s idle 落到 KCP Stream 上时，必须依靠 condvar timed wait（§2.4 提到过，但未与 §3.4 缝合）或等价机制实现。这是文档内部两章之间的裂缝，实施者会直接卡住。</p>
+  </div>
+
+  <div class="issue p0">
+    <h4>P0-2　预读「超读」（over-read）保留机制未设计</h4>
+    <div class="where">涉及章节：§5.7 VLESS 头读取 / §6.1 WS 传输</div>
+    <p>「一次性 8KB 预读」没有说明：预读缓冲区中<b>超出协议头的载荷字节</b>如何不丢失地进入后续 read 路径。Go 版靠 <code>buf.MultiBuffer</code>/<code>BufferedReader</code> 显式传递 first buffer；Zig 侧 Stream 接口只有 read/write，文档没有给出「预读缓冲」的载体设计或 reader 链设计。WS 的 0-RTT early data（Sec-WebSocket-Protocol 携带的首批字节）同样汇入此路，一并受影响。</p>
+  </div>
+
+  <div class="issue p0">
+    <h4>P0-3　数据面分块体没有黄金向量</h4>
+    <div class="where">涉及章节：§5.8 VMess 数据面 / §7.2 密码学测试</div>
+    <p>现有黄金向量只覆盖<b>头</b>（KDF / 密封头 / 响应头），而 chunk.zig 的 <b>nonce 计数器递增</b>、<b>SHAKE128 长度掩码</b>（种子 = bodyIV）、<b>auth_len 独立加密</b>——这些才是 VMess 数据面字节级正确性的核心——反而没有向量锁定。建议附录 A 增加 ≥2 组连续分块向量（含掩码、含递增 nonce），否则数据面只能靠与 Go 客户端互通间接验证，单测门禁形同虚设。</p>
+  </div>
+
+  <h3><span class="badge b-p1">P1</span> 影响验收质量或运维确定性（4 项）</h3>
+
+  <div class="issue p1">
+    <h4>P1-1　无性能验收门禁</h4>
+    <div class="where">涉及章节：§7.4 验收 Checklist</div>
+    <p>Checklist 覆盖了功能、稳定性、体积，唯独没有「同设备同负载 Zig vs Go 对拍：RSS 峰值 / 启动时间 / 代理吞吐 / 每 MB CPU」。本次重写的动机就是资源敏感（体积大、启动内存高），不量化收益就无法向业主证明重写价值。建议 M6 前补充一组对拍指标作为验收项。</p>
+  </div>
+
+  <div class="issue p1">
+    <h4>P1-2　时序测试方法论缺失</h4>
+    <div class="where">涉及章节：§7.1 测试映射表</div>
+    <p>文档只写「时序用例放宽为语义断言」，但 ±120s 时间窗、3 分钟防重放历史的可移植测试<b>需要可注入时钟</b>（TimeSource）。这应作为模块设计要求写进 §5（如 kdf/authid 模块接受时间源参数），而不是留给实施者自由发挥——否则这类测试要么被跳过，要么各写各的。</p>
+  </div>
+
+  <div class="issue p1">
+    <h4>P1-3　VMess 握手 vs KCP 空闲竞争未点破</h4>
+    <div class="where">涉及章节：§5.10 KCP 契约</div>
+    <p>客户端 KCP 建连后若 &gt;30s 不发数据，会被 KCP 30s 空闲判定先杀会话——这与上游行为一致、<b>不算偏差</b>，但文档未明示。实施者联调时极易把它当 bug 去「修」，反而制造了与上游的差异。建议在 KCP 章节以「已知竞态」形式注明。</p>
+  </div>
+
+  <div class="issue p1">
+    <h4>P1-4　内存预算偏乐观</h4>
+    <div class="where">涉及章节：§3.4 内存预算表</div>
+    <p>预算未计入：线程 guard page（约 103 线程 ≈ 0.4MB）、musl 每线程 TLS/errno（约 1–2KB/线程）、分配器元数据、静态二进制 .bss/.data。设备真实空闲仅 5.9–8.7MB，而预算约 20MB，缺口全押「页缓存弹性」——匿名页一旦触碰即常驻。建议预算表补充「最坏常驻」口径列。</p>
+  </div>
+</div>
+
+<div class="card">
+  <h3><span class="badge b-p2">P2</span> 引用与表述瑕疵（4 项）</h3>
+
+  <div class="issue p2">
+    <h4>P2-1　源码路径引用错误</h4>
+    <div class="where">位置：表 4-1（dialer 参数）</div>
+    <p>引用 <code>common/internet/system_dialer.go</code>，实际路径为 <code>transport/internet/system_dialer.go</code>（本仓库 <code>common/internet/</code> 下无此文件）。</p>
+  </div>
+
+  <div class="issue p2">
+    <h4>P2-2　KCP ping 描述含混</h4>
+    <div class="where">位置：表 5-6（KCP 定时器）</div>
+    <p>「ping 固定 5s 发 CommandPing（另每 3s 一个）」把两个定时器混为一谈：5s 是 pingUpdater 的<b>唤醒周期</b>（<code>connection.go:243</code>），3s 才是 <b>CommandPing 实际发送间隔</b>（<code>connection.go:643-644</code>）。照此实现会发出错误的 ping 节奏。</p>
+  </div>
+
+  <div class="issue p2">
+    <h4>P2-3　R1 风险可补充威胁模型结论</h4>
+    <div class="where">位置：风险章节 R1</div>
+    <p>R1 提醒「不要擅自加 TLS」是对的，但建议补一句威胁模型结论：本形态（VLESS 明文 UUID + WS Host 伪装、mKCP 明文）<b>不提供抗主动审查/流量识别能力</b>——这是配置固有属性，应让业主知情决策，而非仅作操作提醒。</p>
+  </div>
+
+  <div class="issue p2">
+    <h4>P2-4　交付现状宜明示</h4>
+    <div class="where">位置：§3.2 目录规划</div>
+    <p><code>zig-src/</code> 目录树（build.zig、src/、tests/）尚未创建，当前仅 3 份资产到位（xray.json、tools/gen_golden_vectors.go、tests/golden/vmess_aead.txt）。目录规划是「目标态」，宜在交付说明中注明，避免实施团队误判交付不完整。</p>
+  </div>
+
+  <h2 style="margin-top:26px;">六、修订建议与结论</h2>
+  <p><strong>修订优先级建议：</strong></p>
+  <ol>
+    <li><strong>移交前（P0）</strong>：补齐三个接缝定义——KCP Stream 的 deadline 机制（condvar timed wait）、预读超读保留的接口/reader 链设计、数据面分块体黄金向量（≥2 组）。这三项都不需要改架构，属于「补定义」，工作量小、收益大。</li>
+    <li><strong>M0–M1 期间（P1）</strong>：验收 Checklist 增加 Zig vs Go 资源对拍项；§5 增加 TimeSource 可注入性设计要求；KCP 章节注明 30s 空闲与 VMess 握手的已知竞态；内存预算补「最坏常驻」口径。</li>
+    <li><strong>随时（P2）</strong>：修正两处引用/表述错误；R1 补威胁模型结论；交付说明注明目录规划为目标态。</li>
+  </ol>
+  <div class="verdict">
+    <b>总结</b>：本设计文档在技术事实准确性、范围纪律、契约意识、测试门禁四个维度都达到了很高水准——22 项源码抽查全部属实、引用行号基本准确，在上游重写类项目中属于少见的高质量文档。它的问题不是「写错了什么」，而是「<b>少定义了三个关键接缝</b>」和「验收缺资源量化维度」。按上述优先级修订后，即可作为实施依据正式移交给实施团队。
+  </div>
+</div>
+
+<div class="footer">
+  Xray-core Zig 版开发设计文档 · 评估报告 ｜ 生成于 2026-10-22 ｜ 核验基线 1b1647cd (v26.10.21)
+</div>
+
+</body>
+</html>

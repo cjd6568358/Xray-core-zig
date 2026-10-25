@@ -1,0 +1,27 @@
+{
+  "log": { "loglevel": "warning", "access": "/dev/null" },
+  "inbounds": [
+    {
+      "tag": "vmess-ws",
+      "listen": "127.0.0.1",
+      "port": 19003,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [ { "id": "de53e864-8530-4212-a3d7-c31e60b62e91", "alterId": 0, "email": "pb8lpgli" } ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/vmess",
+          "host": "",
+          "headers": { "Host": "vmess.smoke.local" }
+        }
+      },
+      "sniffing": { "enabled": false }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct", "settings": { "finalRules": [ { "action": "allow" } ] } }
+  ]
+}

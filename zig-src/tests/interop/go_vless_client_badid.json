@@ -1,0 +1,37 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10802,
+      "protocol": "socks",
+      "settings": { "udp": false }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "vless-out",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 19001,
+            "users": [
+              { "id": "ffffffff-ffff-ffff-ffff-ffffffffffff", "encryption": "none" }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/free",
+          "headers": { "Host": "ltetp.tv189.com" }
+        }
+      }
+    }
+  ]
+}

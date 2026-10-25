@@ -1,0 +1,41 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10803,
+      "protocol": "socks",
+      "settings": { "udp": false }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "vmess-kcp-out",
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 19002,
+            "users": [
+              { "id": "de53e864-8530-4212-a3d7-c31e60b62e91", "security": "auto" }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "kcp",
+        "security": "none",
+        "kcpSettings": {
+          "mtu": 1250,
+          "tti": 20,
+          "uplinkCapacity": 20,
+          "downlinkCapacity": 20,
+          "cwndMultiplier": 1,
+          "maxSendingWindow": 2097152
+        }
+      }
+    }
+  ]
+}

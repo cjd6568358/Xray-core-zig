@@ -66,3 +66,16 @@ ehthumbs.db
 # Other common ignores
 *.bak
 *.tmp
+
+# === Xray-core Zig 移植（本项目新增，M31 首次提交时补） ===
+# 本地通道脚本（含设备凭证）
+.temp/
+# 代理工作区数据（会话/记忆，非交付物）
+.workbuddy-ai/
+# zig 构建缓存（本地 664M）
+zig-src/.zig-cache/
+# 构建产物（部署件在设备/打包机，md5 记录于 PROGRESS.md；重建约 1 分钟，见交付说明）
+zig-src/dist/
+# 大体积渲染图/文档文本导出（源文档为同名 .html/.md）
+zig-src/doc-full.png
+zig-src/.temp_doc.txt

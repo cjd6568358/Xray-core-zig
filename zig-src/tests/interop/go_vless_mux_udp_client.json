@@ -1,0 +1,15 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    { "tag": "socks-in", "listen": "127.0.0.1", "port": 10805, "protocol": "socks", "settings": { "udp": true } }
+  ],
+  "outbounds": [
+    {
+      "tag": "vless-ws-mux",
+      "protocol": "vless",
+      "settings": { "vnext": [ { "address": "127.0.0.1", "port": 19001, "users": [ { "id": "de53e864-8530-4212-a3d7-c31e60b62e91", "encryption": "none" } ] } ] },
+      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/free", "headers": { "Host": "ltetp.tv189.com" } } },
+      "mux": { "enabled": true, "concurrency": 8, "xudpConcurrency": 8 }
+    }
+  ]
+}
