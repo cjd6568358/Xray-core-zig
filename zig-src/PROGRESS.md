@@ -1,6 +1,6 @@
 # Xray-core Zig 版实施进度存档
 
-> 更新时间：2026-10-24（M30：本地工作区整理 + 开机脚本入库；**线上 M28** md5 41e43689。165 passed/1 skipped + 8/8 一键回归全过，代码未提交待审核）
+> 更新时间：2026-10-26（M33：日志时间戳改本地时区并已上机；**线上 M33** md5 808666d8。166 passed/1 skipped + 8/8 一键回归全过，代码未提交待审核）
 > 新会话接手：先读本文件 + `zig-src/交付说明.md`（部署/复跑/偏差/排障）+ `zig-src/Xray-Zig版开发设计文档.html`（v1.1）+ `zig-src/设计文档评审报告.md`
 
 ## 一、任务与总纲
@@ -942,7 +942,9 @@ overload 拒绝、selfcheck 曲线（并发自适应预算）、access 目标聚
 - 外部扫描正确拒绝：vmess handshake timeout ×2（185.206.148.43）、ws handshake dropped
   ×3（5.231.242.16）——M28 关键节点日志捕获，无功能影响
 - 流量画像：客户端 101.82.178.9(3195) + 61.171.248.144(1771)，单用户 pb8lpgli，
-  全部 direct 出站；高峰 19:00 CST(1863/h) 与 21:00 CST(1871/h)；TCP 4246 / UDP 726
+  全部 direct 出站；高峰 **19:00 / 21:00（UTC，= 本地 03:00 / 05:00 CST）**，1863/h 与 1871/h；
+  TCP 4246 / UDP 726。⚠ 此前版本把这两个时刻标成 CST 属笔误：日志时间戳是 UTC，
+  设备本地时区为 UTC+8（M33 起日志已改为本地时区输出，见 M33 节；本段数据取自 M31 旧口径日志）
 
 ### 待关注（均非 Zig 缺陷，已登记）
 1. Google DialFailed ~74 次/19.4h（play/android/mtalk/content-autofill）——设备出口不通
@@ -956,6 +958,122 @@ overload 拒绝、selfcheck 曲线（并发自适应预算）、access 目标聚
 ### 工具修复
 - `tools/commute_report.py` RE_ACCESS 正则漏微秒（TS 后直接 `\s+from`，生产行是
   `...:01.980000  from`）→ access 节恒为 0；已修（TS 后加 `\S*`），复验 4972 条正确解析
+
+## M32：文档/代码一致性核对整改（P1 修复 + 陈旧数字订正）+ P0 凭证泄露登记（轮换已撤销）
+
+### 起因
+用户要求对 git 变更与文档/代码一致性做核对（重点：评审报告 9 处修订是否落实到代码）。
+
+### 核对结论（通过项）
+39 文件 / src 实测 13008 行（文档"12970"为 M26 时点快照）；`zig test --test-no-exec`
+（x86_64-linux-musl）exit 0；KDF/密码层黄金向量逐字节锚定（含 124B 密封请求头 / 38B 响应头、
+aead 线格式 16+18+8+N+16）；D5 红线两方向均用请求侧 key/IV（未被"修正"）；finalRules
+求值顺序 / `[{allow}]` 压制内置 block_private / 协议映射（含 shadowsocks 前缀）/ 私网 18 条
+CIDR 逐条一致；conf 层 alterId 静默忽略、KCP 死字段可解析不报错、h2/h3/quic 移除报错、
+maxSendingWindow>=mtu；D6 鉴权失败日志不含 UUID 明文。.gitignore 排除项均未误跟踪。
+
+### P1 修复：chunk.zig 载荷段超时续读错位（弱网断连隐患）
+`AuthReader` 的 `has_size/p_size/p_padding` 三字段只有消费没有赋值——设计意图对应上游
+`common/crypto/auth.go:172-177` 的 hasSize 缓存，移植时赋值语句漏写。触发链：freedom 上行
+拷贝每轮 1s 读超时切片 → 超时落在载荷段中途 → 重入后重读尺寸段 → 载荷字节被当尺寸段消费 →
+GCM 失败 BadChunk 断连。慢上行（块中途停顿 >1s）即触发，与通勤弱网复盘场景吻合。
+**修复**：载荷段读超时返回前补三字段赋值（`src/proxy/vmess/chunk.zig` 载荷段读循环 catch
+分支）；重入时直接复用已解析的 size/padding——不重读尺寸段、不重耗 SHAKE（M8 红线）。
+**验证**：本地 `zig test --test-no-exec -target x86_64-linux-musl -lc` 默认 cache 与全新
+cache 双跑 exit 0（实测产出 37MB 构件，非空跑）；执行级回归（165 passed/1 skipped、互通
+I1-I5、XUDP 19/19、弱网矩阵）待打包机复跑。
+
+### 🔴 P0 登记：生产 UUID 随公开仓库泄露——轮换方案已按用户要求**撤销**，维持现状
+远程 `github.com/cjd6568358/Xray-core-zig` 是 XTLS/Xray-core 的公开 fork。提交 45f7e000
+内 **26 个文件**（24 个横线形式 + `vmess_smoke.py`/`vless_smoke.py` 的 hex 形式，工作树实测）
+含生产 UUID `de53e864-…`：xray.json、src 测试常量、tests/ 全部相关用例、interop 客户端
+配置、冒烟工具、设计文档 HTML、黄金向量生成器——即光猫 19001/19002 线上在用凭证；
+PROGRESS.md 另含两个客户端公网 IP。历史克隆不可追回。
+
+**经过**：本轮先做过一次仓库侧轮换（生产 `7ff5e54d-…` / 测试向量 `a472db19-…`，未提交）。
+**用户决策（2026-10-26）：不接受轮换，要求还原。** 理由：手机客户端是手工配置的节点，
+改凭证等于断网；用户明确"这种情况不需要脱敏"，只需仓库模板与设备保持一致。
+**已按此回滚**：27 个文件按 `git show HEAD:` 写回旧值；设计文档附录 A 与评审报告引用表整块还原
+（这两处的派生常量 CMD_KEY/AUTH_ID/SEALED 是随 UUID 重算的，若只替换 UUID 字符串会得到
+"UUID 与派生值互不对应"的自相矛盾向量，故整块还原）。
+
+**现状（三份一致，已核验）**：仓库模板 `zig-src/xray.json` = 设备 `/opt/armbian/bin/xray/xray.json`
+（1696B 逐字节相同）= 手机客户端，均为 `de53e864-…`；全仓无新 UUID 与新派生常量残留。
+**残留风险（用户已知悉并接受）**：持有公开仓库副本者已掌握线上凭证；实际利用还需公网 IP、
+端口 19001、WS 路径 `/free`、`Host: ltetp.tv189.com` 四项。
+**若将来轮换，必须三处同批**：设备 `xray.json` 两处 `clients.id` + restart、手机 VLESS+WS 与
+VMess+KCP 两条客户端、仓库模板；任一处漏改即全部客户端断连。**二进制内不含 UUID**
+（`dist/xrayz-aarch64-musl` 实测零命中），故"只换二进制、不覆盖配置"对客户端零影响。
+
+### 文档订正（交付说明.md）
+标题 M20→M32/现役 M28；§1 产物校验 798528B/d5ef50bc→796352B/41e43689（与本地 dist
+实测一致）；§2 部署期望 md5 9c49f551→41e43689；§6.2 并发上限 64→256（与 §3 一致，M21
+上调口径）；§4.2 139/139→165 passed+1 skipped；§5 单测 164→165、XUDP 18/18→19/19，并注明
+丢包各行成功率为 M20 首验口径；§4.6 补 M31 19.4h soak 实测；§3 自检行"72h soak"→
+M27 4.6h/M31 19.4h 实测口径；§1/§10 PROGRESS 区间 M0–M9→M0–M32；§2⑥ 回滚补 M29
+.bak 链清理提示。
+
+### 次要登记（未改代码，后续可选）
+- `replay.zig:63` OOM 静默吞（`pool_a.put ... catch {}`：put 失败时 auth_id 未入池仍放行，防重放弱化）
+- `aead.zig:19` `LengthMismatch` 死变体（从未构造）
+- `golden_test.zig:23` `hexBytes` 死代码（未被调用）
+
+## M33：日志时间戳改为本地时区（对齐 Go log）
+
+### 起因
+M31/M32 巡检发现：`/tmp/xrayz.log` 的时间戳比设备本地时间慢 8 小时。取证链——日志末行
+`2026/10/26 01:36:32.695` 对应文件 mtime `09:36:32.686`（亚秒对齐）；进程启动行
+`2026/10/25 16:31:51` 对应文件 atime `2026/10/26 00:31:51`；设备 `/etc/TZ=UTC-8`（本地 CST）。
+根因：`src/app/log.zig` 的 `formatTimestamp` 只做 UTC 分解，原注释假定"设备容器为 UTC，故与
+Go 等价"——该假定对现役光猫不成立，Go 的 `log` 包用的是本地时区。
+
+### 修复（行为变更，仅日志时间戳，不影响协议与连接）
+- 新增 `localOffsetSecs()`：偏移来源 **`TZ` 环境变量 → `/etc/TZ` → 兜底 UTC(0)**；
+  结果用 `std.atomic.Value(i32)` 缓存，进程内只解析一次（日志热路径上不读文件）
+- 新增 `parsePosixTz()`：按 POSIX 语义解析标准时偏移（**符号反转**：`UTC-8` = 本地 UTC+8），
+  支持 `hh[:mm[:ss]]`、`<...>` 名称、无偏移形式；只取标准时，忽略 DST 段（中国无夏令时）
+- `formatTimestamp()` 改为 `UTC 秒 + 偏移` 后再做 civil 分解；负数用 `@divFloor/@mod` 处理，
+  西半球跨日回退也正确
+- 读 `/etc/TZ` 走 `std.os.linux.open/read`（与 `selfcheck.zig:22 readProc` 同款），
+  环境变量走 `std.c.getenv`（Zig 0.17 的 std 无 `posix.getenv`，构建恒带 `-lc`）
+- 读不到时区信息时偏移 0 → 退回原 UTC 行为，不引入启动失败路径
+
+### 验证
+- `zig test test_all.zig --test-no-exec -target x86_64-linux-musl -lc` **exit 0**
+- 新增单测 `posix TZ offset parsing`：`UTC-8`/`CST-8`/`UTC-08`→+8h、`UTC`/`UTC0`/空→0、
+  `EST5`/`EST5EDT`→-5h、`UTC+5:30`→-5.5h、`<+0330>-3:30`→+3.5h
+- 本机原生跑等价逻辑（`.temp/tz_check.zig`，未入库）14 项全过，含两条**设备实测对齐**：
+  `1792978592`（日志末行 01:36:32Z）→ `2026/10/26 09:36:32`；`1792945911`（启动行）→
+  `2026/10/26 00:31:51`；另含 `epoch±偏移` 的跨日/回退边界
+- 交叉编译 aarch64 通过：`zig build -Dtarget=aarch64-linux-musl -Drelease --prefix .temp/zigout`
+  → **797520B / md5 `808666d892923522ce4bd5beb1da9622`**（M28 为 796352B，+1168B）；
+  ELF 校验 `ET_EXEC` / `e_machine=183(aarch64)` / 无 `PT_INTERP`、无 `PT_DYNAMIC`（真静态）。
+  产物留在 `.temp/zigout/bin/xrayz`，**未覆盖 `dist/`**（避免与文档记录的 M28 md5 冲突）
+- **已上机（2026-10-26 11:43:12 CST cutover）**：备份 M28 到 `/tmp/xrayz.m28.bak` → 上传校验
+  md5 一致 → `run -test` 自检 OK → 隔离端口 29001/29002 冒烟（63s 出 selfcheck、时间戳已是本地
+  11:42:46、干净 kill）→ 换二进制 + `xrayz-start.sh restart` → 新 pid 3280、19001/19002 在听、
+  75s 后 selfcheck 正常、0 Error。**日志时间轴在 `/tmp/xrayz.log` 内可见 8h 跳变**：
+  `03:42:13`（旧二进制 UTC）→ `11:43:12`（新二进制本地 CST），即该文件内的口径分界线
+- 回滚路径：`cp /tmp/xrayz.m28.bak /opt/armbian/bin/xray/xrayz && xrayz-start.sh restart`
+  （`/tmp` 是 tmpfs，重启即失效；长期回滚仍靠 Go 版 `xray`）
+
+### 打包机回归（2026-10-26 11:48–12:04，补跑 M32 P1 + M33）
+源码 tar（197KB/93 文件）上传 `/tmp/xrayz-build` 并 md5 校验；Zig 0.17.0 + Go 1.27.1。
+- `zig build test`（**全新 cache 目录**强制重跑）：**166 passed / 1 skipped / 0 failed**，37s
+- `tools/regress_all.py`（官方一键回归，含 KCP/WS 矩阵）：**8/8 PASS，RC=0**
+  （全量单测 38.9s / native 构建 / 互通 I1–I5 8.8s / XUDP 19/19 51.7s / KCP 0% / KCP 5% / WS 0% / WS 5%）
+- 扩展矩阵（超出 8/8 覆盖的部分，手工补跑）：
+  - WS 弱网 10%、20%、以及 5%+乱序：全 PASS，1MiB 各 3/3（20% 中位数 3.83s）
+  - KCP 10% PASS；**KCP 20% 失败但属上游同水平**——A/B 见 §七 丢包条（Zig 5/10、8/10 小请求，
+    Go 6/10、7/10；1MiB 双方 1–2/3）。判定为 mKCP 固有缺陷，非 Zig 回归
+- 结论：**P1（chunk.zig AuthReader）无回归**，I4 的 VMess+KCP 1MiB sha256 对拍与二次连接均通过
+
+### 口径影响（重要）
+- 历史日志（M33 之前产出）仍是 **UTC**；新日志是 **本地时间**。同一文件内若跨版本，
+  时间轴会出现 8h 跳变——`/tmp` 重启即清空，实际只有重启前的旧段受影响
+- `tools/commute_report.py` 的 `--tz` 含义已在头部注释写明：历史日志 `--tz 8`（默认），
+  新日志 `--tz 0`；报告抬头会打印"日志时间戳为本地时区/UTC"以便自查
+- `交付说明.md` §3 表格、§9.1/§9.2 已同步两段口径
 
 ## 六、下一步（接手即做）
 
@@ -972,14 +1090,24 @@ overload 拒绝、selfcheck 曲线（并发自适应预算）、access 目标聚
 
 ## 七、当前仓库状态
 
-- 测试：**165 passed / 1 skipped / 0 failed，零泄漏**（x86_64-linux-musl，打包机执行，连跑 4 轮稳定）
+- 测试：**166 passed / 1 skipped / 0 failed，零泄漏**（x86_64-linux-musl；M33 在打包机用全新缓存目录复跑确认，37s）
 - 互通：`tests/interop/interop_smoke.py` I1–I5 全过（Go xray 26.10.21 客户端 ↔ Zig 服务端；I4 = 生产链路 VMess+KCP + 1MiB sha256；I5 = mux 10/10）
 - XUDP：`tools/xudp_smoke.py` **19/19**（单连接 8 包对拍 / 多轮建链 / SIGKILL 强杀线程回落 / 6 路并发会话强杀）
-- 丢包：`tools/kcp_loss.py`（mKCP 19002）0/5/10/20% 四档全过；`tools/ws_weaknet.py`（WS 19001）0/5/10/20% + 乱序全过，**弱网 1MiB 吞吐 3.70s vs Go 4.41s（快 16%，见 M23）**
-- 产物：`zig-src/dist/xrayz-aarch64-musl`（M28，796352B ReleaseSafe+strip，md5 **41e43689a158bbeb0022fb0443ded980**）
+- 丢包/弱网（M33 打包机复跑，2026-10-26）：`tools/kcp_loss.py`（mKCP 19002）**0/5/10% 全 PASS**；
+  **20% 档 1MiB 与小请求都会随机掉**，但同机同脚本把服务端换成 Go 上游（`XRAYZ_BIN` 指向 Go 包装器）
+  复现出**同等水平**的失败（Zig 小请求 5/10、8/10，Go 6/10、7/10；1MiB 双方均 1–2/3）——
+  属 mKCP 在 20% 丢包下的固有缺陷（脚本头部已登记：尾包丢失不重传），**非 Zig 回归**；
+  故"四档全过"的旧表述已订正为"0/5/10% 稳定通过，20% 与上游同水平抖动"。
+  `tools/ws_weaknet.py`（WS 19001）**0/5/10/20% + 乱序全过**，1MiB 各 3/3；
+  弱网 1MiB 中位数：0% 0.64s / 5% 0.83s / 10% 2.88s / 20% 3.83s（M23 的 3.70s vs Go 4.41s 为另一台机口径，勿混用）
+- 产物：`zig-src/dist/xrayz-aarch64-musl`（**M33**，797520B ReleaseSafe+strip，md5 **808666d892923522ce4bd5beb1da9622**，已与设备现役件同 md5）
 - 交付文档：`zig-src/交付说明.md`（部署/回滚/复跑/偏差/Phase 2/排障）
-- **线上实例（M28）**：`/opt/armbian/bin/xray/xrayz` md5 `41e43689a158bbeb0022fb0443ded980`（796352B），pid 32193；info 日志 + access 落 `/tmp/xrayz-access.log`；**开机自启已接入**（`/opt/script/xray_start.sh` Zig 优先 + Go 回退）；**M29 备份清理（用户要求"只留一份 go 原版和 zig 版本"）**：已删 `xrayz.m23.bak`(3719ac05) / `xrayz.m26.bak`(e8d1d2b4) / `xrayz.m27.bak`(b83e948f) / `xrayz-start.sh.bak.m22`(4a82917d) / `xray.json.bak.20261023b`(b27743e0)——目录现只含 `xray`（Go 原版/回退件）/ `xrayz`（M28 现役）/ `xray.json` / `xrayz-start.sh` / `soak_report.py`。**回滚路径变更**：不再有 .bak 一键回滚，需回滚时从源码重建（打包机约 1 分钟）或重新部署历史产物。设备其他服务的备份（/opt/apps/smart-iot/、/opt/script/user_init.sh.bak）不属本项目，未动
+- **线上实例（M33）**：`/opt/armbian/bin/xray/xrayz` md5 `808666d892923522ce4bd5beb1da9622`（797520B），
+  2026-10-26 11:43:12 CST cutover，pid 随重启变化（当次 3280）；info 日志 + access 落 `/tmp/xrayz*.log`；**开机自启已接入**（`/opt/script/xray_start.sh` Zig 优先 + Go 回退）；**M29 备份清理（用户要求"只留一份 go 原版和 zig 版本"）**：已删 `xrayz.m23.bak`(3719ac05) / `xrayz.m26.bak`(e8d1d2b4) / `xrayz.m27.bak`(b83e948f) / `xrayz-start.sh.bak.m22`(4a82917d) / `xray.json.bak.20261023b`(b27743e0)——目录现只含 `xray`（Go 原版/回退件）/ `xrayz`（M28 现役）/ `xray.json` / `xrayz-start.sh` / `soak_report.py`。**回滚路径变更**：不再有 .bak 一键回滚，需回滚时从源码重建（打包机约 1 分钟）或重新部署历史产物。设备其他服务的备份（/opt/apps/smart-iot/、/opt/script/user_init.sh.bak）不属本项目，未动
 - Mux 服务端 + XUDP + 统计 + VLESS fallbacks 均已上机；**Mux 客户端（出站）未实现**——Phase 2 如需 Zig 当客户端再排
 - 实机 smoke：WS T1-T5 + VLESS T1-T2 + KCP T1-T3 + VMess T1-T4 + XUDP（DNS 5/5 + TCP over mux 10/10）+ selfcheck，均通过
-- 打包机 `/tmp/xrayz-build` 与本地同步（最后上传 = 当前进度）
+- 打包机 `/tmp/xrayz-build` **已同步到 M33 源码**（2026-10-26 11:47，tar 197KB / 93 文件，md5 校验）。
+  ⚠ 时序说明：**M32（chunk.zig P1）+ M33（日志时区）是先上机、后补跑回归**（cutover 11:43，
+  回归 11:48–12:04）。补跑结果见 M33「打包机回归」节：**8/8 一键回归全过 + 扩展矩阵通过**，
+  P1 修复无回归。今后应恢复"先回归后上机"的次序
 

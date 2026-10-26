@@ -138,6 +138,10 @@ pub const AuthReader = struct {
     shake: ?*chacha_key.ShakeSizeParser = null,
 
     done: bool = false,
+    /// hasSize 缓存（上游 common/crypto/auth.go:172-177 语义）：载荷段读到一半
+    /// 超时向上抛之前，把已解析的 size/padding 存下来；重入时直接复用——
+    /// 不得重读尺寸段（载荷字节会被当尺寸段消费 → GCM 失败 BadChunk 断连），
+    /// 也不得重耗 SHAKE（padding/size 共流，M8 红线）。
     has_size: bool = false,
     p_size: u16 = 0,
     p_padding: u16 = 0,
@@ -213,7 +217,15 @@ pub const AuthReader = struct {
             }
             while (self.work_have < size) {
                 const n = self.inner.read(self.work.items[self.work_have..size]) catch |e| {
-                    if (e == error.Timeout) return e;
+                    if (e == error.Timeout) {
+                        // 载荷段超时：缓存已解析的 size/padding 后再向上抛（1s 拷贝节拍
+                        // 会重入本函数）。缺少缓存时重入将重读尺寸段——载荷字节被当尺寸段
+                        // 消费，AEAD 尺寸段认证失败 → BadChunk 断连（慢上行块中停顿即触发）。
+                        self.has_size = true;
+                        self.p_size = size;
+                        self.p_padding = padding;
+                        return e;
+                    }
                     return error.BadChunk; // 真错误
                 };
                 if (n == 0) return error.BadChunk; // 块中途 EOF

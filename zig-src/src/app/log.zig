@@ -151,17 +151,110 @@ pub const Logger = struct {
     }
 };
 
-/// "2026/10/22 15:04:05.123456 "（UTC；Go log 默认本地时区，设备容器为 UTC，行为等价）
+/// 本地时区偏移缓存（秒；东正西负）。`std.math.minInt(i32)` = 尚未解析。
+/// 只解析一次：进程生命周期内时区不会变，避免每行日志都去读文件。
+var tz_offset_cache = std.atomic.Value(i32).init(std.math.minInt(i32));
+
+/// 本地时区偏移（秒，东正西负）：`TZ` 环境变量优先，其次 `/etc/TZ`，都没有则按 UTC。
+/// 注：Zig 0.17 的 std 没有 `posix.getenv`，这里用 libc 的 `getenv`（构建恒带 `-lc`）。
+pub fn localOffsetSecs() i32 {
+    const cached = tz_offset_cache.load(.monotonic);
+    if (cached != std.math.minInt(i32)) return cached;
+    const off = blk: {
+        if (std.c.getenv("TZ")) |p| break :blk parsePosixTz(std.mem.span(p));
+        if (readEtcTzOffset()) |o| break :blk o;
+        break :blk 0;
+    };
+    tz_offset_cache.store(off, .monotonic);
+    return off;
+}
+
+/// 读 `/etc/TZ` 并直接解析成偏移。用局部缓冲：解析只发生一次，64B 栈开销可忽略，
+/// 且不引入跨线程共享缓冲（多线程同时首日志时不会撕裂）。
+fn readEtcTzOffset() ?i32 {
+    var buf: [64]u8 = undefined;
+    const linux = std.os.linux;
+    const rc = linux.open("/etc/TZ", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: sys.Fd = @intCast(rc);
+    defer _ = linux.close(fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = linux.read(fd, buf[total..].ptr, buf.len - total);
+        switch (linux.errno(n)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => break,
+        }
+        if (n == 0) break;
+        total += n;
+    }
+    if (total == 0) return null;
+    return parsePosixTz(std.mem.trim(u8, buf[0..total], " \t\r\n"));
+}
+
+/// 解析 POSIX TZ 串的**标准时**偏移，返回"本地 = UTC + 返回值"的秒数。
+///
+/// POSIX 的符号与直觉相反：`UTC-8` 里的 -8 是"加到本地时间得到 UTC"，
+/// 故本地偏移 = +8h = 28800（这正是现役光猫 `/etc/TZ` 的取值）。
+/// 只取标准时，忽略 DST 段（`EST5EDT` 仍返回 -5h；中国无夏令时，设备也只给固定偏移）。
+pub fn parsePosixTz(tz: []const u8) i32 {
+    var i: usize = 0;
+    // 时区名：字母串，或 POSIX 扩展的 <...> 形式
+    if (i < tz.len and tz[i] == '<') {
+        i += 1;
+        while (i < tz.len and tz[i] != '>') i += 1;
+        if (i < tz.len) i += 1;
+    } else {
+        while (i < tz.len and std.ascii.isAlphabetic(tz[i])) i += 1;
+    }
+    var negative = false;
+    if (i < tz.len and (tz[i] == '+' or tz[i] == '-')) {
+        negative = tz[i] == '-';
+        i += 1;
+    }
+    var h: i32 = 0;
+    var m: i32 = 0;
+    var s: i32 = 0;
+    var field: u2 = 0;
+    var digits: u8 = 0;
+    while (i < tz.len) : (i += 1) {
+        const c = tz[i];
+        if (c >= '0' and c <= '9') {
+            digits += 1;
+            const v: i32 = c - '0';
+            switch (field) {
+                0 => h = h * 10 + v,
+                1 => m = m * 10 + v,
+                else => s = s * 10 + v,
+            }
+        } else if (c == ':' and field < 2) {
+            field += 1;
+        } else break;
+    }
+    if (digits == 0) return 0; // 只有时区名（如 TZ=UTC）→ 偏移 0
+    const magnitude = h * 3600 + m * 60 + s;
+    return if (negative) magnitude else -magnitude;
+}
+
+/// "2026/10/22 15:04:05.123456 "——按**本地时区**分解，与上游 Go log 的默认行为一致。
+///
+/// 偏移来源：`TZ` 环境变量 → `/etc/TZ` → 兜底 UTC（见 `localOffsetSecs`）。
+/// 现役光猫 `/etc/TZ=UTC-8` 即本地 CST（UTC+8）：此前版本只做 UTC 分解，
+/// 日志比设备本地时间慢 8 小时（2026-10-26 巡检取证：日志末行 `01:36:32.695`
+/// 对应文件 mtime `09:36:32.686`），本次已修正。历史日志（该修复之前产出的）
+/// 仍是 UTC 口径，复盘时需 +8h 换算。
+/// 无 DST 支持：中国无夏令时，且设备 `/etc/TZ` 只给固定偏移。
 pub fn formatTimestamp(buf: []u8) usize {
     const micros = sys.nowUnixMilli();
-    const secs: u64 = @intCast(@divFloor(micros, 1000));
     const millis: u64 = @intCast(@mod(micros, 1000));
-    const days: u64 = secs / 86400;
-    const rem: u64 = secs % 86400;
+    const secs: i64 = @divFloor(micros, 1000) + localOffsetSecs();
+    const days: i64 = @divFloor(secs, 86400);
+    const rem: u64 = @intCast(@mod(secs, 86400));
     const hour: u64 = rem / 3600;
     const minute: u64 = (rem % 3600) / 60;
     const second: u64 = rem % 60;
-    const civil = civilFromDays(@intCast(days));
+    const civil = civilFromDays(days);
 
     return (std.fmt.bufPrint(buf, "{d:0>4}/{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}000 ", .{
         civil.y, civil.m, civil.d, hour, minute, second, millis,
@@ -191,6 +284,23 @@ test "timestamp format shape" {
     try std.testing.expectEqual(@as(u8, '/'), buf[4]);
     try std.testing.expectEqual(@as(u8, ' '), buf[10]);
     try std.testing.expectEqual(@as(u8, ':'), buf[13]);
+}
+
+test "posix TZ offset parsing（符号反转 + 时:分）" {
+    // 现役光猫 /etc/TZ 的取值：UTC-8 = 本地 UTC+8
+    try std.testing.expectEqual(@as(i32, 8 * 3600), parsePosixTz("UTC-8"));
+    try std.testing.expectEqual(@as(i32, 8 * 3600), parsePosixTz("CST-8"));
+    try std.testing.expectEqual(@as(i32, 8 * 3600), parsePosixTz("UTC-08"));
+    // 无偏移
+    try std.testing.expectEqual(@as(i32, 0), parsePosixTz("UTC"));
+    try std.testing.expectEqual(@as(i32, 0), parsePosixTz("UTC0"));
+    try std.testing.expectEqual(@as(i32, 0), parsePosixTz(""));
+    // 西半球：POSIX 正号 = 本地在 UTC 之后
+    try std.testing.expectEqual(@as(i32, -5 * 3600), parsePosixTz("EST5"));
+    try std.testing.expectEqual(@as(i32, -5 * 3600), parsePosixTz("EST5EDT"));
+    // 半小时时区与 <...> 名称形式
+    try std.testing.expectEqual(@as(i32, -19800), parsePosixTz("UTC+5:30"));
+    try std.testing.expectEqual(@as(i32, 12600), parsePosixTz("<+0330>-3:30"));
 }
 
 test "log level mapping (upstream infra/conf/log.go)" {

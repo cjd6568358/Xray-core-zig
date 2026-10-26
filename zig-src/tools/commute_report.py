@@ -5,8 +5,10 @@
 #   连接时长分布 / 短命连接率 / mux 会话配对 / KCP 重传统计 / 握手与拨号错误 /
 #   overload 拒绝 / selfcheck 资源曲线 / access 请求统计 + 启发式结论。
 #
-# 时间基准：**程序日志时间戳是 UTC**（设备系统时区 CST=UTC+8，但 applog 按 UTC 输出）。
-#   --from/--to 按本地时间给（默认 UTC+8，可用 --tz 改），工具内部换算成 UTC 再匹配。
+# 时间基准：`--tz` = "日志时间戳相对本地时间的偏移小时数"（默认 8），分两段口径：
+#   · M33 之前：applog 按 **UTC** 输出（设备本地 CST=UTC+8，日志比本地慢 8h）→ 用默认 --tz 8
+#   · M33 起  ：applog 按 **本地时区** 输出（读 TZ / /etc/TZ，与 Go 版一致）→ 用 --tz 0
+#   --from/--to 始终按本地时间给，工具内部换算后匹配时间戳前缀。
 #
 # 用法：
 #   python3 tools/commute_report.py -f /tmp/xrayz.log \
@@ -181,7 +183,8 @@ def main():
                 return '（开头）'
             t = datetime.datetime.strptime(u, '%Y/%m/%d %H:%M:%S') + datetime.timedelta(hours=args.tz)
             return t.strftime('%Y-%m-%d %H:%M:%S')
-        print('时间窗    : %s → %s（本地 UTC%+d；日志时间戳为 UTC，已换算）' % (back(lo), back(hi), args.tz))
+        src = '本地时区' if args.tz == 0 else 'UTC'
+        print('时间窗    : %s → %s（本地 UTC%+d；日志时间戳为%s，已换算）' % (back(lo), back(hi), args.tz, src))
     print('=' * 62)
 
     # 1) 连接关闭
