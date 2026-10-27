@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const sys = @import("sys.zig");
+const trace_mod = @import("../app/trace.zig");
 
 pub const buffer_size = 8192;
 pub const max_buffers = 256; // 上限 2MB 池
@@ -67,6 +68,9 @@ pub const Session = struct {
     user_email: []const u8 = "",
     dest: [72]u8 = undefined,
     dest_len: usize = 0,
+    /// 连接生命周期打点（app/trace.zig）。由入站协议处理器在建立 Session 时挂上，
+    /// dispatcher/freedom/mux 沿途共用同一条 Trace；null = 不打点（单测默认）。
+    trace: ?*trace_mod.Trace = null,
 
     pub fn setSource(self: *Session, s: []const u8) void {
         const n = @min(s.len, self.source.len);

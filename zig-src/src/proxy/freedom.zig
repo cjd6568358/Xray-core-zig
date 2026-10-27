@@ -27,6 +27,7 @@ const net = @import("../common/net.zig");
 const stream = @import("../core/stream.zig");
 const applog = @import("../app/log.zig");
 const conf_freedom = @import("../conf/freedom.zig");
+const trace_mod = @import("../app/trace.zig");
 
 pub const BuiltRule = conf_freedom.FinalRule.Built;
 pub const RuleAction = conf_freedom.RuleAction;
@@ -331,13 +332,28 @@ pub const Handler = struct {
         var remote: sock.TcpConn = undefined;
         if (blocked == null) {
             // M17：UDP 目标走独立分支（对照上游 freedom.go Network_UDP 分支）
-            if (dest.network == .udp) return processUdp(self.logger, arena, dest, client, stat);
+            if (dest.network == .udp) return processUdp(self.logger, arena, dest, client, stat, sess.trace);
+            const t_dial = trace_mod.stamp(sess.trace);
             remote = self.dialWithRetry(arena, dest) catch |e| {
                 if (e == ProcessError.DialFailed) {
                     self.logDest(.warning, "failed to open connection to {s}", dest, .{});
+                    if (sess.trace) |tr| {
+                        // 失败也记耗时：DNS 卡住 vs 直接 refused，调优方向完全不同
+                        var db: [96]u8 = undefined;
+                        const dn = dest.format(&db);
+                        tr.markDial(if (t_dial > 0) sys.nowMonoMs() - t_dial else 0, db[0..dn]);
+                        tr.setReason(.dial_fail);
+                        trace_mod.countDialFail();
+                    }
                 }
                 return e;
             };
+            if (sess.trace) |tr| {
+                // 拨号成功的耗时与**实际连上的地址**（域名目标可见解析结果）
+                var pb: [64]u8 = undefined;
+                const pn = remote.peerAddr(&pb);
+                tr.markDial(if (t_dial > 0) sys.nowMonoMs() - t_dial else 0, pb[0..pn]);
+            }
             // 域名目标：按实际连接地址复检 block 规则（freedom.go:353-360）
             if (dest.address == .domain and (self.rules.len > 0 or default_kind != .none)) {
                 if (remote.peerV4()) |peer| {
@@ -353,6 +369,7 @@ pub const Handler = struct {
         }
 
         if (blocked) |bdest| {
+            if (sess.trace) |tr| tr.setReason(.blocked);
             self.blackhole(blocked_eval, bdest, client);
             return;
         }
@@ -404,8 +421,8 @@ pub const Handler = struct {
             }
         }
 
-        const up = CopyJob{ .handler = self, .shared = shared, .dir = .up, .src = client.reader, .dst = remote_stream, .remote = remote, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n] };
-        const down = CopyJob{ .handler = self, .shared = shared, .dir = .down, .src = remote_stream, .dst = client.writer, .remote = remote, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n] };
+        const up = CopyJob{ .handler = self, .shared = shared, .dir = .up, .src = client.reader, .dst = remote_stream, .remote = remote, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n], .trace = sess.trace };
+        const down = CopyJob{ .handler = self, .shared = shared, .dir = .down, .src = remote_stream, .dst = client.writer, .remote = remote, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n], .trace = sess.trace };
 
         // M24 线程账：只 spawn **下行**线程，上行拷贝在**调用线程**里跑。
         // 原实现每连接 3 线程（协议线程 + 2 拷贝），现在 2 线程（协议线程兼任上行拷贝）。
@@ -444,6 +461,8 @@ const CopyJob = struct {
     /// M15：本方向要累加的计数器（up: 读客户端数据 → uplink；down: 写给客户端 → downlink）
     up_stats: []const *stats_mod.Counter = &.{},
     down_stats: []const *stats_mod.Counter = &.{},
+    /// 连接打点（null / off = 热路径零开销）
+    trace: ?*trace_mod.Trace = null,
 };
 
 /// 拨号目标解析（从 Handler 提为模块级：processUdp 亦需使用）
@@ -472,6 +491,8 @@ const UdpCopy = struct {
     dir: Direction,
     up_stats: []const *stats_mod.Counter = &.{},
     down_stats: []const *stats_mod.Counter = &.{},
+    /// 连接打点（null / off = 零开销）
+    trace: ?*trace_mod.Trace = null,
 };
 
 fn udpCopyMain(job: *UdpCopy) void {
@@ -486,37 +507,56 @@ fn udpCopyMain(job: *UdpCopy) void {
         switch (job.dir) {
             .up => {
                 // 读 length-prefixed 包 -> send
+                const t_r = trace_mod.stamp(job.trace);
                 const n = udp_pkt.readPacket(job.client.reader, &b) catch {
                     job.shared.failed.store(true, .release);
+                    if (job.trace) |tr| tr.setReason(.reset);
                     break;
                 };
+                const read_ms: u32 = if (t_r > 0) @intCast(@max(0, sys.nowMonoMs() - t_r)) else 0;
                 last_activity = sys.nowMonoMs();
                 for (job.up_stats) |c| c.add(n);
+                const t_w = trace_mod.stamp(job.trace);
                 job.conn.send(b[0..n]) catch {
                     job.shared.failed.store(true, .release);
+                    if (job.trace) |tr| tr.setReason(.reset);
                     break;
                 };
+                if (job.trace) |tr| {
+                    const wr_ms: u32 = if (t_w > 0) @intCast(@max(0, sys.nowMonoMs() - t_w)) else 0;
+                    tr.onData(true, n, read_ms, wr_ms);
+                }
             },
             .down => {
                 // recv（1s 切片）-> 写 length-prefixed 包
                 job.conn.setTimeout(1000);
+                const t_r = trace_mod.stamp(job.trace);
                 const n = job.conn.recv(&b) catch |e| {
                     if (e == error.TimedOut) {
                         if (sys.nowMonoMs() - last_activity >= threshold) {
                             job.shared.failed.store(true, .release);
+                            if (job.trace) |tr| tr.setReason(.idle_timeout);
                             break;
                         }
                         continue;
                     }
                     job.shared.failed.store(true, .release);
+                    if (job.trace) |tr| tr.setReason(.reset);
                     break;
                 };
+                const read_ms: u32 = if (t_r > 0) @intCast(@max(0, sys.nowMonoMs() - t_r)) else 0;
                 last_activity = sys.nowMonoMs();
                 for (job.down_stats) |c| c.add(n);
+                const t_w = trace_mod.stamp(job.trace);
                 udp_pkt.writePacket(job.client.writer, b[0..n]) catch {
                     job.shared.failed.store(true, .release);
+                    if (job.trace) |tr| tr.setReason(.reset);
                     break;
                 };
+                if (job.trace) |tr| {
+                    const wr_ms: u32 = if (t_w > 0) @intCast(@max(0, sys.nowMonoMs() - t_w)) else 0;
+                    tr.onData(false, n, read_ms, wr_ms);
+                }
             },
         }
     }
@@ -545,8 +585,10 @@ fn processUdp(
     dest: net.Destination,
     client: stream.Link,
     stat: ?*const stats_mod.Counters,
+    trace: ?*trace_mod.Trace,
 ) Handler.ProcessError!void {
     // ExponentialBackoff(5, 100)：5 次尝试，间隔 0/100/200/300/400ms（同 dialWithRetry）
+    const t_dial = trace_mod.stamp(trace);
     var remote: ?sock.UdpConn = null;
     var next_delay: u32 = 0;
     var attempt: usize = 0;
@@ -571,9 +613,15 @@ fn processUdp(
         if (std.fmt.bufPrint(&lb, "failed to open connection to {s}", .{db[0..dn]})) |m| {
             logger.warning(m);
         } else |_| {}
+        if (trace) |tr| {
+            tr.markDial(if (t_dial > 0) sys.nowMonoMs() - t_dial else 0, db[0..dn]);
+            tr.setReason(.dial_fail);
+            trace_mod.countDialFail();
+        }
         return Handler.ProcessError.DialFailed;
     };
     defer rconn.close();
+    if (trace) |tr| tr.markDial(if (t_dial > 0) sys.nowMonoMs() - t_dial else 0, "udp");
 
     const shared = arena.create(UdpShared) catch return Handler.ProcessError.OutOfMemory;
     shared.* = .{};
@@ -602,8 +650,8 @@ fn processUdp(
         }
     }
 
-    var up = UdpCopy{ .shared = shared, .conn = rconn, .client = client, .dir = .up, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n] };
-    var down = UdpCopy{ .shared = shared, .conn = rconn, .client = client, .dir = .down, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n] };
+    var up = UdpCopy{ .shared = shared, .conn = rconn, .client = client, .dir = .up, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n], .trace = trace };
+    var down = UdpCopy{ .shared = shared, .conn = rconn, .client = client, .dir = .down, .up_stats = up_list[0..up_n], .down_stats = down_list[0..down_n], .trace = trace };
     // M26 线程账（UDP 同 TCP 手法）：只 spawn 下行，上行在调用线程跑。
     // XUDP 会话线程 4 → 3（DownWriter + 出站/上行 + 下行拷贝）。
     // `up`/`down` 都在本栈帧，defer join 保证 down 存活到 join 完成。
@@ -641,20 +689,26 @@ fn copyMain(job: CopyJob) void {
         const threshold = currentThreshold(shared, job.dir);
         // 读按 1s 切片轮询，让「对向 EOF → 1s 收尾」的阈值动态生效（必须每轮设，见上）
         job.src.setTimeout(1000);
+        // 打点：t_r/t_w 只在开启时取时钟（关闭时 stamp 直接返回 0，不产生 syscall）
+        const t_r = trace_mod.stamp(job.trace);
         const n: usize = job.src.read(b[0..]) catch |e| {
             if (e == error.Timeout) {
                 if (sys.nowMonoMs() - last_activity >= threshold) {
                     shared.failed.store(true, .release);
+                    if (job.trace) |tr| tr.setReason(.idle_timeout);
                     break;
                 }
                 continue;
             }
             shared.failed.store(true, .release);
+            if (job.trace) |tr| tr.setReason(.reset);
             break;
         };
         if (n == 0) { // EOF
+            if (job.trace) |tr| tr.setReason(.eof);
             break;
         }
+        const read_ms: u32 = if (t_r > 0) @intCast(@max(0, sys.nowMonoMs() - t_r)) else 0;
         last_activity = sys.nowMonoMs();
         // M15 计数：up 方向在读成功后计（客户端→服务端）；down 方向在写成功后计
         //（服务端→客户端，严格对应上游 SizeStatWriter 的写时语义）
@@ -662,10 +716,16 @@ fn copyMain(job: CopyJob) void {
             for (job.up_stats) |c| c.add(n);
         }
         job.dst.setTimeout(threshold);
+        const t_w = trace_mod.stamp(job.trace);
         job.dst.writeAll(b[0..n]) catch {
             shared.failed.store(true, .release);
+            if (job.trace) |tr| tr.setReason(.reset);
             break;
         };
+        if (job.trace) |tr| {
+            const wr_ms: u32 = if (t_w > 0) @intCast(@max(0, sys.nowMonoMs() - t_w)) else 0;
+            tr.onData(job.dir == .up, n, read_ms, wr_ms);
+        }
         if (job.dir == .down) {
             for (job.down_stats) |c| c.add(n);
         }

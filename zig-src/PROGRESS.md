@@ -1075,6 +1075,111 @@ Go 等价"——该假定对现役光猫不成立，Go 的 `log` 包用的是本
   新日志 `--tz 0`；报告抬头会打印"日志时间戳为本地时区/UTC"以便自查
 - `交付说明.md` §3 表格、§9.1/§9.2 已同步两段口径
 
+## M34：连接生命周期打点（全流程性能日志）
+
+### 起因
+用户要求："增加打点日志，重点记录客户端连接到服务端后全流程生命周期信息采集，
+方便后期根据日志信息做定向微调性能优化。"
+
+M12/M28 的排障日志（`connection closed` / `mux session opened|closed` / `kcp session closed`）
+只回答"活了多久、有没有断"，回答不了"**慢在哪一段**"：握手慢、拨号慢、目标慢、
+客户端背压慢在日志上长得一模一样。M34 补上**分段时点 + 字节/块计数 + 关闭原因**。
+
+### 设计
+- 新模块 `src/app/trace.zig`：一条连接一个 `Trace` 对象（栈上，无堆分配），
+  沿途只被写、收尾时**只输出一行**。零分配、无锁（跨线程字段用原子量）。
+- **两级粒度 + 独立开关**（配置 `log.trace`）：
+  `off`（只剩一次 bool 判断）/ `summary`（默认，每连接一行）/ `full`（另加 `ev=` 阶段行）。
+  **独立于 loglevel**：`traceInfo/traceDetail` 走 `Logger.emit()`（不经 loglevel 过滤），
+  现场常用 `loglevel=warning` 压业务日志，但打点仍要出——这条已实测（见下"开关矩阵"）。
+- 与既有日志**并存不替换**：`connection closed:` / `mux session …` / `kcp session …`
+  格式一字未动（`tools/commute_report.py`、`ws_weaknet.py` 在解析它们）。
+- 不落任何载荷内容；UUID 仍按 D6 不入日志（只落 email）。
+
+### 埋点位置（全流程）
+| 阶段 | 位置 | 字段 |
+|---|---|---|
+| accept | `core/instance.zig:connEntry` | `conn` 序号、`from`、`tag`、`tr`、`proto` |
+| WS 升级 | 同上（`wssrv.handshake` 后） | `ws_ms`；失败 → `reason=ws_fail` |
+| 协议头首包 | `vless/inbound.zig`、`vmess/inbound.zig` | `hdr_wait_ms`（客户端慢/弱网） |
+| 头解析 | 同上（`parseHeader` 后） | `hdr_parse_ms`（服务端 CPU）、`user`、`dest` |
+| 出站拨号 | `proxy/freedom.zig:process/processUdp` | `dial_ms`、实际连上的地址 |
+| 数据面 | `freedom.zig:copyMain/udpCopyMain` | `up/down` 字节、`*_chunks`、`ttfub/ttfb`、`*_wait_ms`、`*_wr_ms` |
+| mux 会话 | `common/mux.zig:sessionMain` | 子会话行 `sid`；字节/块数回灌父连接，父行 `mux=N` |
+| 关闭 | 各拒绝/失败分支 + 拷贝循环 | `reason`（13 种：eof/reset/idle_timeout/shutdown/overload/ws_fail/handshake_fail/rejected/unsupported/dial_fail/fallback/blocked/mux_end） |
+| 趋势 | `app/selfcheck.zig`（每 60s） | `trace_stats conns/mux/rejected/overload/ws_fail/hdr_fail/dial_fail/dur_avg|max/hdr_avg|max/ttfb_avg|max` |
+
+- 慢路径单独告警（不受粒度影响，只要不是 off）：
+  `trace slow conn=N stage=hdr_wait ms=3501 from=…`——阈值在 `trace.zig` 顶部
+  （ws 1000 / hdr_wait 3000 / dial 2000 / ttfb 3000 / write 5000）。
+- 线程安全细节：上下行拷贝分属两个线程 → `up/down_bytes`、`*_chunks`、`last_act`、
+  `mux_sessions`、`reason` 用 `std.atomic.Value`；`*_wait_max`/`*_wr_max`/阶段时点单写者，
+  join 后才被 `finish()` 读。
+
+### 关键实现坑（改代码前必读）
+1. **mux 子会话的 defer 顺序**：`child.finish()` 必须**早于** `mgr.leave()`。
+   `leave()` 会让 `serve` 的 `waitInflight` 归零 → 释放 `sess_arena` → 上层 `connEntry`
+   收尾；若 finish 在 leave 之后，会拿父 `Trace`（在 connEntry 栈帧）时对方可能已返回 = UAF。
+   现有顺序：`child.finish()` → `mgr.leave()` → `mux session closed` 日志。
+2. **Mux/Rvs 命令没有地址段**：`req.dest` 是 `undefined`，`dest.format()` 会读未初始化内存。
+   vless 侧用 `has_dest`（cmd==tcp/udp）判定，vmess 侧用 `?net.Destination` 判空。
+3. **热路径取时钟**：`trace_mod.stamp()` 在关闭时直接返回 0（不读时钟），
+   拷贝循环据此跳过记账；关闭态每 32KB 块零额外 syscall。
+4. `Trace.init` 的身份字段（source/tag）**无条件**落两份 memcpy，`id`/聚合才 gated——
+   这样关闭态对象也自洽，单测可强制开启后断言。
+
+### 验证
+- 单测：**178 passed / 1 skipped / 0 failed**（M33 基线 166，+12 = trace 11 + TraceLevel 1），
+  含 summary 行逐字段等值断言、阶段省略断言、mux 回灌、finish 幂等、慢阈值、聚合行格式
+- 交叉编译 aarch64：`zig build -Dtarget=aarch64-linux-musl -Drelease` 通过，
+  **820688B / md5 `da26b51977f192a6bdb6e7dd228e2b76`**（M33 797520B，+23168B ≈ +2.9%，
+  主要是格式化串）；产物已进 `dist/xrayz-aarch64-musl` 并上机（见下）
+- 实机（打包机 10.0.0.4，`xray.json` 复制改端口无关项后跑）：
+  - WS+VLESS 直连：`tools/vless_smoke.py` ALL OK；summary 行字段完整
+    （`reason=eof dur_ms=12 … ws_ms=0 hdr_wait_ms=0 dial_ms=0 ttfub_ms=1 ttfb_ms=2 up=8 down=8 up_chunks=1`）
+  - **mux**：新增 `tools/mux_smoke.py`（纯 python mux 客户端，不依赖 Go xray）→ 两并发会话
+    各 echo 回读 OK；子会话行 `trace session conn=3 sid=257 …` 与父行 `mux=2 up=30 down=30
+    up_chunks=2 down_chunks=2` 一致；**进程零 panic、线程回落 4**（验证坑 1 的顺序正确）
+  - 开关矩阵：`off` → 0 条 trace（总日志 7 行，与 M33 行为一致）；`summary` → 2 条汇总 0 条阶段；
+    `full` → 2 汇总 + 10 阶段；`loglevel=warning + trace=summary` → **trace 仍输出**（2 条）
+  - 慢路径 + 并发：慢首包 3.5s → `trace slow conn=1 stage=hdr_wait ms=3501`；
+    12 线程 × 4 轮并发 48 连接全部 roundtrip OK、49 条汇总、无 `up=0` 异常行、无 panic
+- **未跑**：`tests/interop/interop_smoke.py` / `xudp_smoke.py`（打包机 `/tmp/xray-go-bin` 与
+  Go 源码已被 tmpfs 清理，且该机当前无外网，无法重建 Go 参考二进制）。
+  本次改动只新增观测代码（数据面仅多两次 vDSO 取时钟），协议语义零变更；
+  下次拿到 Go 二进制后应补跑一次一键回归。
+
+### 上机（2026-10-27 10:24:55 CST cutover，按交付说明 §2 流程）
+- 备份：`/tmp/xrayz.m33.bak`（md5 808666d8 校验一致）+ `/tmp/xray.json.m33.bak`（配置未改动，
+  全程 md5 `3be6ccd8…` 不变；**仓库与设备 `xray.json` 都没加 `trace` 键**，靠默认 summary 生效）
+- 上传：`/tmp/xrayz.m34.new`（stdin 流式 cat，md5 本地/远端一致）→ `run -test` 用**设备现役配置**
+  自检 exit 0（两条 DEPRECATED 警告与 M33 同款）
+- 隔离端口冒烟（29001/29002，独立 access）：从开发机打真实 VLESS 连接（目标设备自身 10022 SSH）→
+  回 506B SSH banner；日志出 `trace conn=1 reason=eof dur_ms=26 … down=506 ttfb_ms=15` ✓
+- cutover：`xrayz-start.sh stop`（端口全释放）→ `cp` 到同目录 `xrayz.new` + `mv` 原子替换
+  （避免 ETXTBSY/半写窗口）→ `xrayz-start.sh start` → pid 6993、19001 TCP + 19002 UDP 在听
+- 上机后逐路径验证（均从开发机 10.0.0.3 打真实流量）：
+  - **WS+VLESS/TCP**：`trace conn=1 … dest=tcp:192.168.1.1:10022 … down=506`，`trace_stats conns=1` ✓
+  - **KCP+VMess**：`tools/kcp_smoke.py` 改指向设备 → T1/T2/T3 全过；日志出
+    `trace conn=3 reason=rejected … tr=kcp proto=vmess` 与
+    `trace conn=2 reason=handshake_fail dur_ms=30004 hdr_wait_ms=30003`（只建会话不发头的客户端，
+    正是打点要暴露的那类"连上了但没通"）✓
+  - **mux 子会话**：`trace session conn=6 sid=257/514 … down=506 ttfb_ms=5/8` +
+    父连接 `down=1012 down_chunks=2 mux=2`（聚合正确）✓；两并发会话各拿到 SSH banner
+- 健康：`Error=0 / panic=0`，threads=4，VmRSS 988KB；selfcheck 与 trace_stats 每 60s 正常
+- 回滚：`cp /tmp/xrayz.m33.bak /opt/armbian/bin/xray/xrayz && /opt/armbian/bin/xray/xrayz-start.sh restart`
+  （`/tmp` 是 tmpfs，重启即失效；长期回滚仍靠 Go 版 `xray`）
+- ⚠ 踩坑登记：`pkill -f xrayz.m34.new` 会**匹配到执行它的 shell 自身**（命令行里含该字符串），
+  导致脚本自杀（本次无副作用，生产未停）。清理同名进程一律用 `pidof <名字>` 或
+  `readlink /proc/*/exe` 精确匹配。
+
+### 口径影响
+- 部署后 `/tmp/xrayz.log` 会多出：每连接 1 行 `trace conn=`（约 300B）+ 每 60s 1 行
+  `trace_stats`；`full` 档再乘 6–10 倍。设 `"log": {"trace": "off"}` 可完全关闭。
+- **默认就是 `summary`**：设备 `xray.json` 不含 `trace` 键 → 部署即生效，无需改配置
+  （也因此**没有改动仓库 `xray.json`**，保持与设备一致）。
+- 仓库 `xray.json` 与设备配置本次均未修改；客户端侧零影响。
+
 ## 六、下一步（接手即做）
 
 1. ~~M7 VMess 入站~~ / ~~M8 测试移植 + Go 互通~~ / ~~M9 VMess+KCP 互通~~ / ~~M10 丢包回归~~ / ~~M17 UDP 代理命令~~ / ~~M19 UDP 底座真因~~ / ~~M20 XUDP over mux~~（均已完成）
@@ -1090,7 +1195,8 @@ Go 等价"——该假定对现役光猫不成立，Go 的 `log` 包用的是本
 
 ## 七、当前仓库状态
 
-- 测试：**166 passed / 1 skipped / 0 failed，零泄漏**（x86_64-linux-musl；M33 在打包机用全新缓存目录复跑确认，37s）
+- 测试：**178 passed / 1 skipped / 0 failed，零泄漏**（x86_64-linux-musl；M34 在打包机复跑确认；
+  M33 时 166，M34 新增 12 条 = 打点 11 + TraceLevel 1）
 - 互通：`tests/interop/interop_smoke.py` I1–I5 全过（Go xray 26.10.21 客户端 ↔ Zig 服务端；I4 = 生产链路 VMess+KCP + 1MiB sha256；I5 = mux 10/10）
 - XUDP：`tools/xudp_smoke.py` **19/19**（单连接 8 包对拍 / 多轮建链 / SIGKILL 强杀线程回落 / 6 路并发会话强杀）
 - 丢包/弱网（M33 打包机复跑，2026-10-26）：`tools/kcp_loss.py`（mKCP 19002）**0/5/10% 全 PASS**；
@@ -1100,12 +1206,16 @@ Go 等价"——该假定对现役光猫不成立，Go 的 `log` 包用的是本
   故"四档全过"的旧表述已订正为"0/5/10% 稳定通过，20% 与上游同水平抖动"。
   `tools/ws_weaknet.py`（WS 19001）**0/5/10/20% + 乱序全过**，1MiB 各 3/3；
   弱网 1MiB 中位数：0% 0.64s / 5% 0.83s / 10% 2.88s / 20% 3.83s（M23 的 3.70s vs Go 4.41s 为另一台机口径，勿混用）
-- 产物：`zig-src/dist/xrayz-aarch64-musl`（**M33**，797520B ReleaseSafe+strip，md5 **808666d892923522ce4bd5beb1da9622**，已与设备现役件同 md5）
+- 产物：`zig-src/dist/xrayz-aarch64-musl`（**M34**，820688B ReleaseSafe+strip，md5 **da26b51977f192a6bdb6e7dd228e2b76**，已与设备现役件同 md5；
+  M33 为 797520B / 808666d8）
 - 交付文档：`zig-src/交付说明.md`（部署/回滚/复跑/偏差/Phase 2/排障）
-- **线上实例（M33）**：`/opt/armbian/bin/xray/xrayz` md5 `808666d892923522ce4bd5beb1da9622`（797520B），
-  2026-10-26 11:43:12 CST cutover，pid 随重启变化（当次 3280）；info 日志 + access 落 `/tmp/xrayz*.log`；**开机自启已接入**（`/opt/script/xray_start.sh` Zig 优先 + Go 回退）；**M29 备份清理（用户要求"只留一份 go 原版和 zig 版本"）**：已删 `xrayz.m23.bak`(3719ac05) / `xrayz.m26.bak`(e8d1d2b4) / `xrayz.m27.bak`(b83e948f) / `xrayz-start.sh.bak.m22`(4a82917d) / `xray.json.bak.20261023b`(b27743e0)——目录现只含 `xray`（Go 原版/回退件）/ `xrayz`（M28 现役）/ `xray.json` / `xrayz-start.sh` / `soak_report.py`。**回滚路径变更**：不再有 .bak 一键回滚，需回滚时从源码重建（打包机约 1 分钟）或重新部署历史产物。设备其他服务的备份（/opt/apps/smart-iot/、/opt/script/user_init.sh.bak）不属本项目，未动
+- **线上实例（M34）**：`/opt/armbian/bin/xray/xrayz` md5 `da26b51977f192a6bdb6e7dd228e2b76`（820688B），
+  2026-10-27 10:24:55 CST cutover，pid 随重启变化（当次 6993）；info 日志 + access 落 `/tmp/xrayz*.log`，
+  **M34 起日志内另有每连接 `trace conn=` 行与每 60s `trace_stats` 行**；**开机自启已接入**（`/opt/script/xray_start.sh` Zig 优先 + Go 回退）；**M29 备份清理（用户要求"只留一份 go 原版和 zig 版本"）**：已删 `xrayz.m23.bak`(3719ac05) / `xrayz.m26.bak`(e8d1d2b4) / `xrayz.m27.bak`(b83e948f) / `xrayz-start.sh.bak.m22`(4a82917d) / `xray.json.bak.20261023b`(b27743e0)——目录现只含 `xray`（Go 原版/回退件）/ `xrayz`（M34 现役）/ `xray.json` / `xrayz-start.sh` / `soak_report.py`。**回滚路径变更**：不再有 .bak 一键回滚，需回滚时从源码重建（打包机约 1 分钟）或重新部署历史产物（M34 当次的临时回滚件 `/tmp/xrayz.m33.bak` 在 tmpfs，重启即失效）
 - Mux 服务端 + XUDP + 统计 + VLESS fallbacks 均已上机；**Mux 客户端（出站）未实现**——Phase 2 如需 Zig 当客户端再排
-- 实机 smoke：WS T1-T5 + VLESS T1-T2 + KCP T1-T3 + VMess T1-T4 + XUDP（DNS 5/5 + TCP over mux 10/10）+ selfcheck，均通过
+- 实机 smoke：WS T1-T5 + VLESS T1-T2 + KCP T1-T3 + VMess T1-T4 + XUDP（DNS 5/5 + TCP over mux 10/10）+ selfcheck，均通过；
+  **M34 起新增** `tools/mux_smoke.py`（纯 python mux 客户端，不依赖 Go），并在设备上逐路径验证
+  WS+VLESS / KCP+VMess / mux 子会话三条链路的打点（详见 M34「上机」节）
 - 打包机 `/tmp/xrayz-build` **已同步到 M33 源码**（2026-10-26 11:47，tar 197KB / 93 文件，md5 校验）。
   ⚠ 时序说明：**M32（chunk.zig P1）+ M33（日志时区）是先上机、后补跑回归**（cutover 11:43，
   回归 11:48–12:04）。补跑结果见 M33「打包机回归」节：**8/8 一键回归全过 + 扩展矩阵通过**，

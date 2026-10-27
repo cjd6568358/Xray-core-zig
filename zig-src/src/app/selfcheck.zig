@@ -10,6 +10,7 @@ const sys = @import("../common/sys.zig");
 const applog = @import("../app/log.zig");
 const buf = @import("../common/buf.zig");
 const stats_mod = @import("stats.zig");
+const trace_mod = @import("trace.zig");
 
 pub const Stats = struct {
     conns: u32 = 0,
@@ -129,6 +130,9 @@ pub fn run(
         logger.info(msg);
         // M15：非零 channel 打一行 stats（出口为日志——上游经 gRPC StatsService，已登记）
         if (stats) |sm| emitStats(sm, logger);
+        // 连接打点聚合（进程累计）：一行的趋势足够判断"最近是不是变慢/被拒变多"，
+        // 逐连接明细看 `trace conn=` 行
+        trace_mod.emitAggregate(logger);
     }
 }
 

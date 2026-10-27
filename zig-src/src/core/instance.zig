@@ -25,6 +25,7 @@ const vmess_inbound = @import("../proxy/vmess/inbound.zig");
 const stats_mod = @import("../app/stats.zig");
 const vmess_replay = @import("../proxy/vmess/replay.zig");
 const selfcheck = @import("../app/selfcheck.zig");
+const trace_mod = @import("../app/trace.zig");
 
 pub const Instance = struct {
     gpa: std.mem.Allocator,
@@ -152,6 +153,7 @@ pub const Instance = struct {
                 var sb: [48]u8 = undefined;
                 const sn = conn.peerAddr(sb[0..]);
                 self.logOverload(if (sn > 0) sb[0..sn] else "unknown");
+                trace_mod.countOverload();
                 conn.close();
                 continue;
             }
@@ -185,16 +187,15 @@ pub const Instance = struct {
         const sn = conn.peerAddr(src_buf[0..]);
         const source = if (sn > 0) src_buf[0..sn] else "unknown";
 
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const ctx = arena.create(stream_mod.TcpStreamCtx) catch return;
-        ctx.* = .{ .conn = conn };
-        var sess_stream = ctx.stream();
-
         // M12 排障日志：连接生命周期（弱网下短命连接 = 客户端重连风暴的直接证据）
         const started_ms = sys.nowMonoMs();
         const network: []const u8 = if (entry.ib.stream) |s| s.protocol_name else "tcp";
+
+        // 连接打点：t0 取 accept 之后的第一时间点（本函数入口即协议线程启动处），
+        // 之后每个阶段（ws / hdr / dial / 首字节 / 关闭）都往这一条 Trace 上记。
+        var tr = trace_mod.Trace.init(self.logger, transportOf(network), entry.ib.protocol, source, entry.ib.tag);
+        defer tr.finish(); // 最后执行（LIFO）：汇总行 = 本连接收尾结论
+
         defer {
             var lb: [192]u8 = undefined;
             if (std.fmt.bufPrint(&lb, "connection closed: from={s} tag={s} transport={s} protocol={s} duration={d}ms", .{ source, entry.ib.tag, network, entry.ib.protocol, sys.nowMonoMs() - started_ms })) |m| {
@@ -202,18 +203,35 @@ pub const Instance = struct {
             } else |_| {}
         }
 
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const ctx = arena.create(stream_mod.TcpStreamCtx) catch return;
+        ctx.* = .{ .conn = conn };
+        var sess_stream = ctx.stream();
+
         // 传输面：websocket → 握手升级为 WS 会话；tcp → 裸流
         if (std.mem.eql(u8, network, "websocket")) {
             const w = if (entry.ib.stream.?.ws) |w| w else return;
             switch (wssrv.handshake(arena, sess_stream, .{ .host = w.host, .path = w.path })) {
-                .ok => |ws| sess_stream = ws.stream(),
-                .rejected => return, // 错误响应已写
+                .ok => |ws| {
+                    tr.markWs(sys.nowMonoMs() - started_ms);
+                    sess_stream = ws.stream();
+                },
+                .rejected => {
+                    // 错误响应已写；对端不是 WS 流量（扫描器/误连）
+                    tr.setReason(.ws_fail);
+                    trace_mod.countWsFail();
+                    return;
+                },
                 .dropped => {
                     // 弱网半包头/解析失败：原先静默，排障期必须留痕
                     var wb: [128]u8 = undefined;
                     if (std.fmt.bufPrint(&wb, "ws handshake dropped (read/parse failure) from {s}", .{source})) |m| {
                         self.logger.warning(m);
                     } else |_| {}
+                    tr.setReason(.ws_fail);
+                    trace_mod.countWsFail();
                     return;
                 },
             }
@@ -221,10 +239,10 @@ pub const Instance = struct {
 
         // 协议面：vless（M5）/ vmess（M7）
         if (std.mem.eql(u8, entry.ib.protocol, "vless")) {
-            vless_inbound.handle(arena, self.gpa, sess_stream, conn, entry.ib.vless_users, self.logger, &self.dispatcher, entry.ib.tag, source, entry.ib.vless_fallbacks);
+            vless_inbound.handle(arena, self.gpa, sess_stream, conn, entry.ib.vless_users, self.logger, &self.dispatcher, entry.ib.tag, source, &tr, entry.ib.vless_fallbacks);
         } else if (std.mem.eql(u8, entry.ib.protocol, "vmess")) {
             if (self.vmess_filter == null or self.vmess_history == null) return;
-            vmess_inbound.handle(arena, self.gpa, sess_stream, entry.ib.vmess_users, self.vmess_filter.?, self.vmess_history.?, self.logger, &self.dispatcher, entry.ib.tag, source);
+            vmess_inbound.handle(arena, self.gpa, sess_stream, entry.ib.vmess_users, self.vmess_filter.?, self.vmess_history.?, self.logger, &self.dispatcher, entry.ib.tag, source, &tr);
         }
     }
 
@@ -295,6 +313,7 @@ pub const Instance = struct {
                 var sb: [48]u8 = undefined;
                 const sn = sock.formatV4(conn.peer, sb[0..]);
                 self.instance.logOverload(if (sn > 0) sb[0..sn] else "kcp-session");
+                trace_mod.countOverload();
                 conn.forceTerminate();
                 return;
             }
@@ -363,9 +382,13 @@ pub const Instance = struct {
             const sn = sock.formatV4(conn.peer, &src_buf);
             const source = if (sn > 0) src_buf[0..sn] else "kcp-session";
 
+            // 连接打点（KCP 面无 accept，t0 取会话线程启动点；无 WS 阶段）
+            var tr = trace_mod.Trace.init(inst.logger, .mkcp, ta.ib.protocol, source, ta.ib.tag);
+            defer tr.finish();
+
             if (std.mem.eql(u8, ta.ib.protocol, "vmess")) {
                 if (inst.vmess_filter == null or inst.vmess_history == null) return;
-                vmess_inbound.handle(arena, inst.gpa, sess_stream, ta.ib.vmess_users, inst.vmess_filter.?, inst.vmess_history.?, inst.logger, &inst.dispatcher, ta.ib.tag, source);
+                vmess_inbound.handle(arena, inst.gpa, sess_stream, ta.ib.vmess_users, inst.vmess_filter.?, inst.vmess_history.?, inst.logger, &inst.dispatcher, ta.ib.tag, source, &tr);
                 // M28：dispatch 已返回、closeConn 尚未执行——此刻取发送统计
                 // （retrans>0 = 会话期间发生过重传，即弱网丢包的直接证据）
                 const st = conn.sendingStats();
@@ -387,6 +410,13 @@ const ListenerEntry = struct {
     thread: ?std.Thread,
     ib: *const conf.RuntimeInbound,
 };
+
+/// 传输面名 → 打点枚举（conf 的 protocol_name：tcp / websocket / mkcp）
+fn transportOf(network: []const u8) trace_mod.Transport {
+    if (std.mem.eql(u8, network, "websocket")) return .websocket;
+    if (std.mem.eql(u8, network, "mkcp")) return .mkcp;
+    return .tcp;
+}
 
 // ============================ 信号处理 ============================
 

@@ -55,11 +55,32 @@ pub const LogLevel = enum {
     }
 };
 
+/// 连接打点粒度（配置键 `log.trace`，见 app/trace.zig）。
+/// 独立于 loglevel：loglevel 决定"打不打得出来"，trace 决定"打多细"。
+pub const TraceLevel = enum(u8) {
+    off = 0,
+    summary = 1,
+    full = 2,
+
+    /// 未配置 → summary（默认开，单连接一行）；未知值也落 summary
+    pub fn fromString(s: []const u8) TraceLevel {
+        var buf: [16]u8 = undefined;
+        if (s.len > buf.len) return .summary;
+        for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        const lower = buf[0..s.len];
+        if (std.mem.eql(u8, lower, "off") or std.mem.eql(u8, lower, "none") or std.mem.eql(u8, lower, "false")) return .off;
+        if (std.mem.eql(u8, lower, "full") or std.mem.eql(u8, lower, "debug")) return .full;
+        return .summary;
+    }
+};
+
 pub const Logger = struct {
     mu: sys.Mutex = .{},
     level: Severity = .warning,
     enabled: bool = true, // loglevel none → false
     access_fd: ?sys.Fd = null, // /dev/null 走真实打开（POSIX），"none" 为 null
+    /// 连接打点粒度（app/trace.zig 读取；`Logger.init` 保持默认 summary）
+    trace_level: TraceLevel = .summary,
 
     pub fn init(level: LogLevel, access_path: []const u8) Logger {
         var l = Logger{
@@ -92,6 +113,13 @@ pub const Logger = struct {
     pub fn log(self: *Logger, sev: Severity, msg: []const u8) void {
         if (!self.enabled) return;
         if (@intFromEnum(sev) > @intFromEnum(self.level)) return;
+        self.emit(sev, msg);
+    }
+
+    /// 落盘本体（不含 loglevel 判定）：打点通道用它绕开 loglevel 门槛，
+    /// 使 `log.trace` 成为真正独立的开关（loglevel=warning 时 trace 仍可出）。
+    fn emit(self: *Logger, sev: Severity, msg: []const u8) void {
+        if (!self.enabled) return;
         var line_buf: [1536]u8 = undefined;
         var w: usize = 0;
         w += formatTimestamp(line_buf[w..]);
@@ -124,6 +152,31 @@ pub const Logger = struct {
 
     pub fn debug(self: *Logger, msg: []const u8) void {
         self.log(.debug, msg);
+    }
+
+    // ---------------- 连接打点通道（app/trace.zig） ----------------
+    // 与 info/debug 的区别：只看 `trace_level` 闸门，**不看 loglevel**
+    //（现场常常 loglevel=warning 压制业务日志，但仍要看每连接汇总行）。
+
+    pub fn traceOn(self: *const Logger) bool {
+        return self.enabled and self.trace_level != .off;
+    }
+
+    pub fn traceFull(self: *const Logger) bool {
+        return self.enabled and self.trace_level == .full;
+    }
+
+    /// 每连接一行汇总
+    pub fn traceInfo(self: *Logger, msg: []const u8) void {
+        if (!self.traceOn()) return;
+        self.emit(.info, msg);
+    }
+
+    /// 阶段明细（仅 trace=full）——只翻 `log.trace` 一个开关即可看时间线，
+    /// 不必同时把 loglevel 调到 debug（debug 档留给协议级逐包排障）
+    pub fn traceDetail(self: *Logger, msg: []const u8) void {
+        if (!self.traceFull()) return;
+        self.emit(.info, msg);
     }
 
     /// access 记录（本配置落 /dev/null；格式对齐 common/log AccessMessage 简形）
@@ -311,4 +364,25 @@ test "log level mapping (upstream infra/conf/log.go)" {
     try std.testing.expectEqual(LogLevel.warning, LogLevel.fromString("warning"));
     try std.testing.expectEqual(LogLevel.warning, LogLevel.fromString("unknown-value"));
     try std.testing.expectEqual(LogLevel.warning, LogLevel.fromString("DEBUG-XX"));
+}
+
+test "trace level mapping（log.trace：off/summary/full）" {
+    try std.testing.expectEqual(TraceLevel.off, TraceLevel.fromString("off"));
+    try std.testing.expectEqual(TraceLevel.off, TraceLevel.fromString("NONE"));
+    try std.testing.expectEqual(TraceLevel.full, TraceLevel.fromString("full"));
+    try std.testing.expectEqual(TraceLevel.full, TraceLevel.fromString("Debug"));
+    // 未配置/未知值 → summary（默认开）
+    try std.testing.expectEqual(TraceLevel.summary, TraceLevel.fromString(""));
+    try std.testing.expectEqual(TraceLevel.summary, TraceLevel.fromString("summary"));
+    try std.testing.expectEqual(TraceLevel.summary, TraceLevel.fromString("whatever"));
+
+    // 闸门语义：off 全关；summary 只出汇总；full 两档都出
+    var lg = Logger{ .enabled = true, .trace_level = .off };
+    try std.testing.expect(!lg.traceOn() and !lg.traceFull());
+    lg.trace_level = .summary;
+    try std.testing.expect(lg.traceOn() and !lg.traceFull());
+    lg.trace_level = .full;
+    try std.testing.expect(lg.traceOn() and lg.traceFull());
+    lg.enabled = false; // loglevel none
+    try std.testing.expect(!lg.traceOn() and !lg.traceFull());
 }

@@ -25,6 +25,7 @@ const conf_vless = @import("../../conf/vless.zig");
 const mux = @import("../../common/mux.zig");
 const udp_pkt = @import("../udp_packet.zig");
 const fb_mod = @import("fallback.zig");
+const trace_mod = @import("../../app/trace.zig");
 
 const handshake_timeout_ms: i64 = 60 * 1000; // policy Handshake（表 4-1）
 pub const pre_read_size: usize = 8192; // buf.Size 一次性预读
@@ -309,14 +310,21 @@ pub fn handle(
     dsp: *dispatcher_mod.Dispatcher,
     inbound_tag: []const u8,
     source: []const u8,
+    /// 连接生命周期打点（trace=off 时全部方法空转）
+    tr: *trace_mod.Trace,
     /// M16 VLESS fallbacks（上游 proxy/vless/inbound）：空 = 不启用回落
     fallbacks: []const conf_vless.Fallback,
 ) void {
     // Handshake 60s（表 4-1；上游 SetReadDeadline(Handshake)）
     conn_stream.setTimeout(handshake_timeout_ms);
 
+    // 打点：首包等待 = 客户端建链后到发出 VLESS 头的时延（弱网/客户端慢的直接证据）
+    const t_hdr = sys.nowMonoMs();
     var first: [pre_read_size]u8 = undefined;
     const first_len = conn_stream.read(&first) catch |e| {
+        tr.markHeaderWait(sys.nowMonoMs() - t_hdr);
+        tr.setReason(.handshake_fail);
+        trace_mod.countHdrFail();
         // M12 排障：握手读失败必须留痕——区分「客户端放弃/弱网慢握手」与「服务端异常」
         var wb: [160]u8 = undefined;
         if (std.fmt.bufPrint(&wb, "vless handshake read {s} from {s}", .{ @errorName(e), source })) |m| {
@@ -324,27 +332,42 @@ pub fn handle(
         } else |_| {}
         return;
     };
-    if (first_len == 0) return; // 对端直关
+    tr.markHeaderWait(sys.nowMonoMs() - t_hdr);
+    if (first_len == 0) { // 对端直关
+        tr.setReason(.eof);
+        return;
+    }
     // M16：上游 `isfb && firstLen < 18` → "fallback directly"（首包太短，非 VLESS 流量）
     if (fallbacks.len > 0 and first_len < 18) {
-        const fb = fb_mod.selectFallback(fallbacks, first[0..first_len]) orelse return;
+        const fb = fb_mod.selectFallback(fallbacks, first[0..first_len]) orelse {
+            tr.setReason(.rejected);
+            return;
+        };
+        tr.setReason(.fallback);
         fb_mod.serveFallback(arena, client, conn_stream, first[0..first_len], fb, source, logger);
         return;
     }
 
     var hr = HeadReader{ .pre = first[0..first_len], .inner = conn_stream, .arena = arena };
+    const t_parse = sys.nowMonoMs();
     const req = parseHeader(&hr, users) catch |e| {
         // M16：上游 DecodeRequestHeader(isfb,…) 失败即 isfb → 回落（坏 UUID/坏版本/坏 addons）
         if (fallbacks.len > 0) {
             if (fb_mod.selectFallback(fallbacks, first[0..first_len])) |fb| {
                 logger.warning("vless/inbound: invalid request, falling back");
+                tr.setReason(.fallback);
                 fb_mod.serveFallback(arena, client, conn_stream, first[0..first_len], fb, source, logger);
                 return;
             }
         }
         switch (e) {
-            ParseError.EndOfStream => return, // EOF 静默（上游 Cause==io.EOF 不记 rejected）
+            ParseError.EndOfStream => {
+                tr.setReason(.eof); // EOF 静默（上游 Cause==io.EOF 不记 rejected）
+                return;
+            },
             else => {
+                tr.setReason(.rejected);
+                trace_mod.countRejected();
                 // access rejected（D6：reason 不含 UUID 明文）+ warning
                 const reason: []const u8 = switch (e) {
                     ParseError.InvalidVersion => "invalid request version",
@@ -366,6 +389,15 @@ pub fn handle(
         }
     };
 
+    // 打点：头解析完成（服务端 CPU 成本）+ 身份/目标固化。
+    // Mux/Rvs 不写地址段 → req.dest 未初始化，只有 TCP/UDP 才可取。
+    {
+        const has_dest = req.command == @intFromEnum(Command.tcp) or req.command == @intFromEnum(Command.udp);
+        var dbuf: [96]u8 = undefined;
+        const dn: usize = if (has_dest) req.dest.format(&dbuf) else 0;
+        tr.markHeaderDone(sys.nowMonoMs() - t_parse, req.user.email, req.command, dbuf[0..dn]);
+    }
+
     // command：TCP 直连 dispatch；Mux 走 mux 服务端（M9）；UDP/Rvs 仍不支持（表 1-2）
     const is_mux = req.command == @intFromEnum(Command.mux);
     // M17：command UDP(2) 放行（对照上游 Destination()：UDP 时返回 UDPDestination；
@@ -377,10 +409,12 @@ pub fn handle(
     // （实测：客户端 42ms 关闭、服务端无 access 记录）。XUDP over mux 已由 M20 落地
     // （见 mux.zig 的 GlobalID 分支），此处拒绝的只是裸 UDP 命令这条无人使用的路径。
     if (is_udp) {
+        tr.setReason(.unsupported);
         logger.warning("vless/inbound: bare UDP command not supported (clients use XUDP over mux), connection closed");
         return;
     }
     if (!is_mux and req.command != @intFromEnum(Command.tcp)) {
+        tr.setReason(.unsupported);
         var wb: [128]u8 = undefined;
         if (std.fmt.bufPrint(&wb, "vless/inbound: command {d} is not supported in this build, connection closed", .{req.command})) |m| {
             logger.warning(m);
@@ -389,6 +423,7 @@ pub fn handle(
     }
     // 客户端 flow 非空（本版账号 flow 恒空）→ 上游 default 分支文案
     if (req.flow.len != 0) {
+        tr.setReason(.unsupported);
         var wb: [160]u8 = undefined;
         if (std.fmt.bufPrint(&wb, "unknown request flow {s}", .{req.flow})) |m| {
             logger.warning(m);
@@ -400,7 +435,10 @@ pub fn handle(
     conn_stream.setTimeout(-1);
 
     // 响应头 {version=0x00, addons_len=0x00} 先行 flush
-    conn_stream.writeAll(&.{ 0x00, 0x00 }) catch return;
+    conn_stream.writeAll(&.{ 0x00, 0x00 }) catch {
+        tr.setReason(.reset);
+        return;
+    };
 
     // 载荷直通（无 addons 时明文流）：预读余量 + 底层流
     var pr = PrefixedReader{ .prefix = hr.pre[hr.pos..], .inner = conn_stream };
@@ -408,11 +446,13 @@ pub fn handle(
         .inbound_tag = inbound_tag,
         .inbound_protocol = "vless",
         .user_email = req.user.email,
+        .trace = tr, // dispatcher / freedom / mux 沿途共用同一条打点
     };
     sess.setSource(source);
     if (is_mux) {
         // Mux：同一份载荷流上跑 mux 服务端（对照上游 DispatchLink → mux.Server）
         mux.serve(arena, gpa, dsp, &sess, .{ .reader = pr.stream(), .writer = conn_stream }, logger, source);
+        tr.setReason(.mux_end); // 主循环退出（EOF / idle / 帧解析失败）
         return;
     }
     var udest = req.dest;
@@ -503,10 +543,12 @@ const ProcArgs = struct {
     dsp: *dispatcher_mod.Dispatcher,
     tag: []const u8,
     source: []const u8,
+    /// 打点对象（默认空壳 = 关闭，单测不产生日志）
+    trace: trace_mod.Trace = .{},
 };
 
 fn handleMain(a: *ProcArgs) void {
-    handle(a.arena, a.gpa, a.stream, a.client, a.users, a.logger, a.dsp, a.tag, a.source, a.fallbacks);
+    handle(a.arena, a.gpa, a.stream, a.client, a.users, a.logger, a.dsp, a.tag, a.source, &a.trace, a.fallbacks);
 }
 
 fn buildDispatcher(arena: std.mem.Allocator, lg: *applog.Logger, pool: *buf.Pool, echo_port: u16) dispatcher_mod.Dispatcher {

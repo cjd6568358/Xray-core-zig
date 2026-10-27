@@ -29,6 +29,7 @@ const stream_mod = @import("../core/stream.zig");
 const applog = @import("../app/log.zig");
 const dispatcher_mod = @import("../app/dispatcher.zig");
 const udp_pkt = @import("../proxy/udp_packet.zig");
+const trace_mod = @import("../app/trace.zig");
 
 pub const STATUS_NEW: u8 = 0x01;
 pub const STATUS_KEEP: u8 = 0x02;
@@ -526,6 +527,17 @@ fn sessionMain(job: *SessionJob) void {
     const job_logger = job.logger;
     const job_source = job.source; // M28：同理必须快照（job 在 sess_arena 内）
     const started_ms = sys.nowMonoMs();
+    // 会话级打点：每个 mux 会话单独一行（含目标/字节/关闭原因），
+    // 字节量在 finish 时回灌父连接 → 父连接汇总是整条 TCP 的真实总量。
+    // ⚠️ child 是本栈帧局部量，parent 在 connEntry 栈帧（serve 返回前必存活）。
+    // defer 顺序：child.finish() 必须早于 mgr.leave()——leave() 会让 serve 的
+    // waitInflight 返回并释放 sess_arena，之后再碰 parent 就可能撞上上层收尾。
+    var child = trace_mod.Trace{};
+    if (job.sess.trace) |parent| {
+        var db: [96]u8 = undefined;
+        const dn = job.dest.format(&db);
+        child = parent.initChild(job.id, db[0..dn]);
+    }
     defer {
         var lb: [160]u8 = undefined;
         if (std.fmt.bufPrint(&lb, "mux session closed: id={d} dest_port={d} from={s} duration={d}ms", .{ job_id, job_dest_port, job_source, sys.nowMonoMs() - started_ms })) |m| {
@@ -533,7 +545,10 @@ fn sessionMain(job: *SessionJob) void {
         } else |_| {}
     }
     defer job.mgr.leave(); // 本会话及其 freedom 拷贝线程全部结束
-    job.dsp.dispatch(job.arena, &job.sess, job.dest, job.link) catch {};
+    defer child.finish(); // 必须晚于 dispatch、早于 leave（见上）
+    var sess = job.sess;
+    sess.trace = if (child.enabled) &child else null;
+    job.dsp.dispatch(job.arena, &sess, job.dest, job.link) catch {};
     // 出站结束 → 上行 EOF（唤醒还在读的上行拷贝）、下行写失败（writer 退出）
     job.up.pipe.closeWrite();
     // M20：下行写侧也必须由这里兜底关闭。正常路径由出站拷贝线程 shutdownWrite 传播

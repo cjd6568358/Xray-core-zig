@@ -22,6 +22,7 @@ pub const addr = @import("common/addr.zig");
 pub const applog = @import("app/log.zig");
 pub const selfcheck = @import("app/selfcheck.zig");
 pub const stats = @import("app/stats.zig");
+pub const trace = @import("app/trace.zig");
 pub const conf = @import("conf/config.zig");
 pub const conf_transport = @import("conf/transport.zig");
 pub const conf_freedom = @import("conf/freedom.zig");
@@ -194,6 +195,7 @@ fn runCommand(alloc: std.mem.Allocator, config_path: []const u8, test_only: bool
     // —— M3 起接入 core.Instance（启动失败 exit 255，对齐 main/run.go exit(-1)）——
     const gpa = std.heap.smp_allocator;
     var run_logger = applog.Logger.init(runtime.log_level, runtime.access_path);
+    run_logger.trace_level = runtime.trace_level; // log.trace：连接打点粒度
     defer run_logger.deinit();
 
     const inst = core_instance.Instance.create(gpa, &runtime, &run_logger, version) catch {
@@ -237,6 +239,7 @@ test {
     _ = &net.Address.parseAddress;
     _ = &addr.writePortThenAddress;
     _ = &applog.Logger.log;
+    _ = &applog.TraceLevel.fromString;
     _ = &conf.buildRuntime;
     _ = &conf_transport.StreamConfig.build;
     _ = &conf_freedom.FreedomConfig.build;
@@ -246,6 +249,10 @@ test {
     // M3 运行时
     _ = &sock.TcpConn.read;
     _ = &buffer.Pool.get;
+    // 连接生命周期打点
+    _ = &trace.Trace.init;
+    _ = &trace.Trace.finish;
+    _ = &trace.emitAggregate;
     _ = &core_stream.TcpStreamCtx.stream;
     _ = &dispatcher.Dispatcher.dispatch;
     _ = &freedom.Handler.process;

@@ -48,6 +48,9 @@ pub const LogConfig = struct {
     loglevel: []const u8 = "warning",
     access: []const u8 = "",
     errorlog: []const u8 = "", // json 键 "error"
+    /// 连接生命周期打点粒度（app/trace.zig）：off / summary（默认）/ full。
+    /// 与 loglevel 正交：loglevel 决定"能不能打出来"，trace 决定"打多细"。
+    trace: []const u8 = "summary",
 };
 
 /// policy 段（对照 app/policy config.proto：system/user 两级）
@@ -118,6 +121,8 @@ pub const RuntimeOutbound = struct {
 pub const RuntimeConfig = struct {
     log_level: log.LogLevel,
     access_path: []const u8,
+    /// 连接打点粒度（log.trace）；main 启动时赋给 Logger.trace_level
+    trace_level: log.TraceLevel = .summary,
     policy: PolicyConfig = .{},
     inbounds: []const RuntimeInbound,
     outbounds: []const RuntimeOutbound,
@@ -164,6 +169,7 @@ pub fn buildRuntime(arena: std.mem.Allocator, logger: *log.Logger, root: *const 
 
     return .{
         .log_level = log.LogLevel.fromString(root.log.loglevel),
+        .trace_level = log.TraceLevel.fromString(root.log.trace),
         .policy = root.policy,
         .access_path = root.log.access,
         .inbounds = inbounds.items,

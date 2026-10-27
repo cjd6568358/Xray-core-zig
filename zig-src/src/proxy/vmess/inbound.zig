@@ -28,6 +28,7 @@ const replay_mod = @import("replay.zig");
 const chunk = @import("chunk.zig");
 const mux = @import("../../common/mux.zig");
 const net = @import("../../common/net.zig");
+const trace_mod = @import("../../app/trace.zig");
 
 const handshake_timeout_ms: i64 = 60 * 1000; // policy Handshake（表 4-1）
 const max_header_payload: usize = 16384; // 上游 drainer 上限量级；放宽为硬上限（偏差登记）
@@ -43,18 +44,27 @@ pub fn handle(
     dsp: *dispatcher_mod.Dispatcher,
     tag: []const u8,
     source: []const u8,
+    /// 连接生命周期打点（trace=off 时全部方法空转）
+    tr: *trace_mod.Trace,
 ) void {
     conn_stream.setTimeout(handshake_timeout_ms);
 
     var auth_id: [16]u8 = undefined;
+    // 打点：AuthID 首包等待 = 客户端建链后到发出 VMess 头的时延
+    const t_hdr = sys.nowMonoMs();
     // M12 排障：握手读失败留痕（弱网慢握手/客户端放弃的区分依据）
     readFull(conn_stream, auth_id[0..]) catch |e| {
+        tr.markHeaderWait(sys.nowMonoMs() - t_hdr);
+        tr.setReason(.handshake_fail);
+        trace_mod.countHdrFail();
         var wb: [160]u8 = undefined;
         if (std.fmt.bufPrint(&wb, "vmess handshake read {s} from {s}", .{ @errorName(e), source })) |m| {
             logger.warning(m);
         } else |_| {}
         return;
     };
+    tr.markHeaderWait(sys.nowMonoMs() - t_hdr);
+    const t_parse = sys.nowMonoMs();
 
     var v = validator_mod.Validator{ .users = users, .filter = filter };
     const user = v.match(&auth_id, sys.nowUnixSecs()) catch |e| {
@@ -65,7 +75,7 @@ pub fn handle(
             validator_mod.MatchError.Replay => "replayed request",
             else => "invalid request",
         };
-        reject(logger, source, reason);
+        reject(logger, tr, source, reason);
         return;
     };
 
@@ -80,11 +90,11 @@ pub fn handle(
         return;
     };
     const payload_len = vmess_aead.openHeaderLength(&head_blk, &user.cmd_key, &auth_id) catch {
-        reject(logger, source, "AEAD read failed");
+        reject(logger, tr, source, "AEAD read failed");
         return;
     };
     if (payload_len < 41 or payload_len > max_header_payload) {
-        reject(logger, source, "AEAD read failed");
+        reject(logger, tr, source, "AEAD read failed");
         return;
     }
     const sealed = arena.alloc(u8, payload_len + 16) catch return;
@@ -95,7 +105,7 @@ pub fn handle(
     @memcpy(rest[26..], sealed);
     const aead_data = arena.alloc(u8, payload_len) catch return;
     _ = vmess_aead.openHeaderPayload(aead_data, rest, &user.cmd_key, &auth_id) catch {
-        reject(logger, source, "AEAD read failed");
+        reject(logger, tr, source, "AEAD read failed");
         return;
     };
 
@@ -108,7 +118,7 @@ pub fn handle(
             // Go：addrParser 解析失败被吞 → Address==nil → 末检 "invalid remote address"
             error.InvalidAddress => "invalid remote address",
         };
-        reject(logger, source, reason);
+        reject(logger, tr, source, reason);
         return;
     };
 
@@ -116,7 +126,7 @@ pub fn handle(
     // attack, but this is a AEAD request"）
     if (!history.addIfNotExists(user.uuid.bytes, h.request_key, h.request_iv)) {
         logger.warning("duplicated session id, possibly under replay attack, but this is a AEAD request");
-        reject(logger, source, "duplicated session id");
+        reject(logger, tr, source, "duplicated session id");
         return;
     }
 
@@ -127,10 +137,12 @@ pub fn handle(
     // M19：同 VLESS——服务端 UDP 逻辑已验证，但客户端互通走 XUDP over mux
     // （M20 已落地于 mux 路径），裸 UDP 命令真实客户端不使用，保持拒绝。
     if (is_udp) {
+        tr.setReason(.unsupported);
         logger.warning("vmess/inbound: bare UDP command not supported (clients use XUDP over mux), connection closed");
         return;
     }
     if (!is_mux and h.command != vmess_encoding.Cmd.tcp) {
+        tr.setReason(.unsupported);
         var wb: [128]u8 = undefined;
         if (std.fmt.bufPrint(&wb, "vmess/inbound: command {d} is not supported in this build, connection closed", .{h.command})) |m| {
             logger.warning(m);
@@ -139,7 +151,7 @@ pub fn handle(
     }
     // Mux 帧不带地址段（Go：Mux 时不解析 dest）
     const dest: ?net.Destination = if (is_mux) null else (h.dest orelse {
-        reject(logger, source, "invalid remote address");
+        reject(logger, tr, source, "invalid remote address");
         return;
     });
 
@@ -152,7 +164,7 @@ pub fn handle(
         else => {
             var wb: [96]u8 = undefined;
             const reason = std.fmt.bufPrint(&wb, "unknown security type: {s}", .{vmess_encoding.securityTypeName(h.security)}) catch "unknown security type";
-            reject(logger, source, reason);
+            reject(logger, tr, source, reason);
             return;
         },
     };
@@ -162,12 +174,19 @@ pub fn handle(
     const auth_len = (h.option & vmess_encoding.RequestOption.authenticated_length) != 0;
     if (global_padding and !masking) {
         // Go: padding = sizeParser.(PaddingLengthGenerator) 断言失败
-        reject(logger, source, "invalid option: RequestOptionGlobalPadding");
+        reject(logger, tr, source, "invalid option: RequestOptionGlobalPadding");
         return;
     }
 
     // 清 Handshake deadline（上游 SetReadDeadline(time.Time{})）
     conn_stream.setTimeout(-1);
+
+    // 打点：头解析完成（AEAD 解封 + 38B 头 + 去重，全在服务端 CPU 上）
+    {
+        var dbuf: [96]u8 = undefined;
+        const dn: usize = if (dest) |d| d.format(&dbuf) else 0;
+        tr.markHeaderDone(sys.nowMonoMs() - t_parse, user.email, h.command, dbuf[0..dn]);
+    }
 
     // 响应头 38B AEAD 块。response_header 字节**回显客户端请求头里的值**
     // （协议防中间人设计：客户端随机选 1 字节，服务端原样带回；
@@ -176,7 +195,10 @@ pub fn handle(
     // 不设置 Option（inbound.go:306），EncodeResponseHeader 写 byte(header.Option)=0。
     var rbuf: [38]u8 = undefined;
     vmess_encoding.encodeResponseHeader(&rbuf, &h.request_key, &h.request_iv, h.response_header, 0);
-    conn_stream.writeAll(&rbuf) catch return;
+    conn_stream.writeAll(&rbuf) catch {
+        tr.setReason(.reset);
+        return;
+    };
 
     // ---- 分块体 ----
     // 请求体：requestBodyKey/IV
@@ -229,6 +251,7 @@ pub fn handle(
         .inbound_tag = tag,
         .inbound_protocol = "vmess",
         .user_email = user.email,
+        .trace = tr, // dispatcher / freedom / mux 沿途共用同一条打点
     };
     sess.setSource(source);
 
@@ -239,6 +262,7 @@ pub fn handle(
     if (is_mux) {
         // Mux：在分块体之上跑 mux 服务端（对照上游 DispatchLink → mux.Server）
         mux.serve(arena, gpa, dsp, &sess, .{ .reader = req_reader.stream(), .writer = resp_writer.stream() }, logger, source);
+        tr.setReason(.mux_end); // 主循环退出（EOF / idle / 帧解析失败）
         if ((h.option & vmess_encoding.RequestOption.chunk_stream) != 0) {
             resp_writer.writeAll(&.{}) catch {};
         }
@@ -271,7 +295,9 @@ fn readFull(inner: stream_mod.Stream, out: []u8) !void {
     }
 }
 
-fn reject(logger: *applog.Logger, source: []const u8, reason: []const u8) void {
+fn reject(logger: *applog.Logger, tr: *trace_mod.Trace, source: []const u8, reason: []const u8) void {
+    tr.setReason(.rejected);
+    trace_mod.countRejected();
     var ab: [256]u8 = undefined;
     if (std.fmt.bufPrint(&ab, "from {s} rejected {s}", .{ source, reason })) |m| {
         logger.access(m);
@@ -311,10 +337,12 @@ const ProcArgs = struct {
     dsp: *dispatcher_mod.Dispatcher,
     tag: []const u8,
     source: []const u8,
+    /// 打点对象（默认空壳 = 关闭，单测不产生日志）
+    trace: trace_mod.Trace = .{},
 };
 
 fn handleMain(a: *ProcArgs) void {
-    handle(a.arena, a.gpa, a.stream, a.users, a.filter, a.history, a.logger, a.dsp, a.tag, a.source);
+    handle(a.arena, a.gpa, a.stream, a.users, a.filter, a.history, a.logger, a.dsp, a.tag, a.source, &a.trace);
 }
 
 test "vmess inbound: AEAD 全链（AuthID+密封头+分块体 D5）→ dispatch → freedom → echo" {
