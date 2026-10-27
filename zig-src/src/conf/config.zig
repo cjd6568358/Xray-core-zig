@@ -116,6 +116,9 @@ pub const RuntimeOutbound = struct {
     tag: []const u8,
     protocol: []const u8,
     freedom_rules: []const freedom.FinalRule.Built = &.{},
+    /// M35：拨号参数（缺省 = conf/freedom.zig 的上游默认）
+    dial_timeout_ms: i64 = freedom.default_dial_timeout_ms,
+    dial_attempts: usize = freedom.default_dial_attempts,
 };
 
 pub const RuntimeConfig = struct {
@@ -266,6 +269,8 @@ fn buildOutbound(arena: std.mem.Allocator, logger: *log.Logger, ob: *const Outbo
                 return ConfigError.Freedom;
             };
             built.freedom_rules = f.final_rules;
+            built.dial_timeout_ms = f.dial_timeout_ms;
+            built.dial_attempts = f.dial_attempts;
         }
     } else {
         diag.set("unsupported outbound protocol: {s} (Phase 1: freedom only)", .{ob.protocol});

@@ -217,16 +217,17 @@ pub const Handler = struct {
     logger: *applog.Logger,
     pool: *buf.Pool,
     rules: []const BuiltRule = &.{},
+    /// M35：拨号参数由配置注入，缺省值 = conf/freedom.zig 的上游默认，
+    /// 即「不配 = 行为不变」。详见 conf/freedom.zig 同段注释。
+    dial_timeout_ms: i64 = conf_freedom.default_dial_timeout_ms,
+    dial_attempts: usize = conf_freedom.default_dial_attempts,
+    dial_backoff_base_ms: u32 = conf_freedom.default_dial_backoff_base_ms,
 
     pub const ProcessError = error{
         TargetNotSpecified,
         DialFailed,
         OutOfMemory,
     };
-
-    const dial_timeout_ms: i64 = 16 * 1000;
-    const dial_attempts = 5;
-    const dial_backoff_base_ms: u32 = 100;
 
     fn logDest(self: *Handler, sev: applog.Severity, comptime fmt: []const u8, dest: net.Destination, args: anytype) void {
         var dbuf: [96]u8 = undefined;
@@ -236,24 +237,31 @@ pub const Handler = struct {
         self.logger.log(sev, msg);
     }
 
-    /// Go retry.ExponentialBackoff(5, 100)：共 5 次尝试，失败间隔 0/100/200/300/400ms
+    /// Go retry.ExponentialBackoff(5, 100)：共 dial_attempts 次尝试，失败间隔按
+    /// 基数递增。M35：timeout/attempts 改为由 Handler 注入（配置缺省 = 上游默认）。
     fn dialWithRetry(self: *Handler, arena: std.mem.Allocator, dest: net.Destination) ProcessError!sock.TcpConn {
-        _ = self;
         var next_delay: u32 = 0;
         var attempt: usize = 0;
-        while (attempt < dial_attempts) : (attempt += 1) {
+        while (attempt < self.dial_attempts) : (attempt += 1) {
             const sa = resolveTarget(arena, dest) orelse {
                 sys.sleepMs(next_delay);
-                next_delay += dial_backoff_base_ms;
+                next_delay += self.dial_backoff_base_ms;
                 continue;
             };
-            if (sock.dialTcp(.{ .v4 = sa }, dial_timeout_ms)) |conn| {
+            if (sock.dialTcp(.{ .v4 = sa }, self.dial_timeout_ms)) |conn| {
                 sock.setKeepalive45(conn.fd);
                 return conn;
             } else |_| {
                 sys.sleepMs(next_delay);
-                next_delay += dial_backoff_base_ms;
+                next_delay += self.dial_backoff_base_ms;
             }
+        }
+        // M35：全部尝试失败 → 主动让该域名缓存失效。可能是 CDN 换了 IP，
+        // 下一轮要么重新解析到新地址，要么仍是入口不可达（那种情况下
+        // 重新解析的额外开销可忽略，因为一天也就百来条）。
+        switch (dest.address) {
+            .domain => |d| sock.dnsInvalidate(d),
+            else => {},
         }
         return ProcessError.DialFailed;
     }
@@ -470,7 +478,8 @@ fn resolveTarget(arena: std.mem.Allocator, dest: net.Destination) ?sys.SockaddrI
     switch (dest.address) {
         .ipv4 => |b| return sys.SockaddrIn.init(b, dest.port),
         .domain => |d| {
-            const ip = sock.resolveV4(arena, d) orelse return null;
+            // M35：走带 TTL 缓存的解析（TCP 与 UDP 两条拨号路径共用此函数）
+            const ip = sock.resolveV4Cached(arena, d) orelse return null;
             return sys.SockaddrIn.init(ip, dest.port);
         },
         .ipv6 => return null, // Phase 1 拨号面 v4-only（sock 层 AF.INET）

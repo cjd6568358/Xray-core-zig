@@ -173,12 +173,18 @@ pub const FinalRule = struct {
 pub const FreedomConfig = struct {
     domainStrategy: ?[]const u8 = null,
     finalRules: []const FinalRule = &.{},
+    /// M35 新增，可选：拨号单次超时（毫秒）。缺省 = 与上游一致，行为不变。
+    dialTimeoutMs: ?u64 = null,
+    /// M35 新增，可选：拨号重试次数。缺省 = 与上游一致，行为不变。
+    dialAttempts: ?u64 = null,
     // 上游已移除并告警的遗留字段（出现时告警一次，等价于忽略）
     ipsBlocked: ?std.json.Value = null,
     ipsBlocked4: ?std.json.Value = null,
 
     pub const Built = struct {
         final_rules: []const FinalRule.Built,
+        dial_timeout_ms: i64 = default_dial_timeout_ms,
+        dial_attempts: usize = default_dial_attempts,
     };
 
     pub fn build(self: *const FreedomConfig, arena: std.mem.Allocator, logger: anytype) !Built {
@@ -192,9 +198,71 @@ pub const FreedomConfig = struct {
             const built = try r.build(arena);
             rules.append(arena, built) catch return error.OutOfMemory;
         }
-        return .{ .final_rules = rules.items };
+        return .{
+            .final_rules = rules.items,
+            .dial_timeout_ms = clampedTimeout(self.dialTimeoutMs, logger),
+            .dial_attempts = clampedAttempts(self.dialAttempts, logger),
+        };
     }
 };
+
+// ============================ M35：拨号参数可调 ============================
+//
+// 单一真源：这四个默认值与 proxy/freedom.zig 的 Handler 字段同源，
+// 任一侧改动都会被编译期捕获，避免出现"两处魔数互不一致"。
+//
+// 【为什么改成可调】光猫实测（本次观察窗口 8.45h / 2312 连接）：
+// 149 条出站拨号失败耗时 p50=81218ms，全部落在出口不可达的目标上
+// （Google 系 111 条 + 测速节点 32 条）。成因是三个常数相乘：
+//   单次超时 16s × 重试 5 次 + 退避 1s ≈ 81s
+// 每条这样的连接白白占住「线程 + fd + 并发槽」81 秒，合计约 3.35h / 8.45h。
+//
+// 【为什么不直接改死默认】反向证据：成功拨号的 dial_ms 本身有重尾
+// （p95=66ms 但 p99=19061ms、max=79806ms，其中 37 条 >5s 最终仍然连上）。
+// 这些连接靠的正是后续重试才成功 —— 若把 attempts 硬砍到 3，会把
+// "慢成功"扭成"失败"，是真实的体验倒退。
+// 故：**默认值保持上游原样，仅在 xray.json 里显式调参**，随时可改回、不必重编译。
+
+/// 单次 connect 超时（对应上游 freedom 的 dial timeout）
+pub const default_dial_timeout_ms: i64 = 16 * 1000;
+/// 拨号尝试次数（对应上游 retry.ExponentialBackoff(5, 100)）
+pub const default_dial_attempts: usize = 5;
+/// 退避基数（0/100/200/300/400ms）
+pub const default_dial_backoff_base_ms: u32 = 100;
+
+pub const min_dial_timeout_ms: i64 = 100;
+pub const max_dial_timeout_ms: i64 = 60 * 1000;
+pub const min_dial_attempts: usize = 1;
+pub const max_dial_attempts: usize = 10;
+
+/// 越界值静默回落默认并告警一次：保证"配置缺失/手滑写错 = 原行为"，
+/// 不引入新的启动失败路径。
+fn clampedTimeout(v: ?u64, logger: anytype) i64 {
+    const raw = v orelse return default_dial_timeout_ms;
+    if (raw < min_dial_timeout_ms or raw > max_dial_timeout_ms) {
+        // logger 的 warning 只收整串（见 app/log.zig），先落缓冲再告警
+        var b: [160]u8 = undefined;
+        const m = std.fmt.bufPrint(&b, "freedom dialTimeoutMs={d} out of range [{d},{d}], fallback to {d}", .{
+            raw, min_dial_timeout_ms, max_dial_timeout_ms, default_dial_timeout_ms,
+        }) catch return default_dial_timeout_ms;
+        logger.warning(m);
+        return default_dial_timeout_ms;
+    }
+    return @intCast(raw);
+}
+
+fn clampedAttempts(v: ?u64, logger: anytype) usize {
+    const raw = v orelse return default_dial_attempts;
+    if (raw < min_dial_attempts or raw > max_dial_attempts) {
+        var b: [160]u8 = undefined;
+        const m = std.fmt.bufPrint(&b, "freedom dialAttempts={d} out of range [{d},{d}], fallback to {d}", .{
+            raw, min_dial_attempts, max_dial_attempts, default_dial_attempts,
+        }) catch return default_dial_attempts;
+        logger.warning(m);
+        return default_dial_attempts;
+    }
+    return @intCast(raw);
+}
 
 test "final rule allow-all (xray.json 形态)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -235,4 +303,74 @@ test "final rule unknown action rejected (upstream message path)" {
     defer arena_state.deinit();
     const r = FinalRule{ .action = "forward" };
     try std.testing.expectError(FinalRule.Error.UnknownAction, r.build(arena_state.allocator()));
+}
+
+// ============================ M35：拨号参数可调 ============================
+
+/// 兜底 logger：记录是否告警过（conf 层的告警我不能依赖真实 Logger 输出）
+const WarnSpy = struct {
+    n: usize = 0,
+    last: [160]u8 = undefined,
+    last_len: usize = 0,
+    pub fn warning(self: *WarnSpy, msg: []const u8) void {
+        self.n += 1;
+        if (msg.len <= self.last.len) {
+            @memcpy(self.last[0..msg.len], msg);
+            self.last_len = msg.len;
+        }
+    }
+};
+
+test "M35: 缺省 = 上游默认行为，零行为变更" {
+    var spy = WarnSpy{};
+    const c = FreedomConfig{ .finalRules = &.{} };
+    try std.testing.expectEqual(default_dial_timeout_ms, clampedTimeout(c.dialTimeoutMs, &spy));
+    try std.testing.expectEqual(default_dial_attempts, clampedAttempts(c.dialAttempts, &spy));
+    try std.testing.expectEqual(@as(i64, 16 * 1000), default_dial_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 5), default_dial_attempts);
+    try std.testing.expectEqual(@as(usize, 0), spy.n); // 缺省路径不产生告警
+}
+
+test "M35: 合法值生效（本设备调优形态 8000ms）" {
+    var spy = WarnSpy{};
+    try std.testing.expectEqual(@as(i64, 8000), clampedTimeout(8000, &spy));
+    try std.testing.expectEqual(@as(usize, 5), clampedAttempts(5, &spy));
+    try std.testing.expectEqual(@as(usize, 0), spy.n);
+}
+
+test "M35: 越界/零值静默回落默认，不引入启动失败路径" {
+    var spy = WarnSpy{};
+    // 0 —— JSON 里写 "" 或 0 都是手滑，必须回落而不是"0ms 超时"自杀
+    try std.testing.expectEqual(default_dial_timeout_ms, clampedTimeout(0, &spy));
+    try std.testing.expectEqual(default_dial_attempts, clampedAttempts(0, &spy));
+    try std.testing.expectEqual(@as(usize, 2), spy.n);
+
+    spy = WarnSpy{};
+    try std.testing.expectEqual(default_dial_timeout_ms, clampedTimeout(999999, &spy));
+    try std.testing.expectEqual(default_dial_attempts, clampedAttempts(999, &spy));
+    try std.testing.expectEqual(@as(usize, 2), spy.n);
+}
+
+test "M35: 边界值取得到（含端点）" {
+    var spy = WarnSpy{};
+    try std.testing.expectEqual(min_dial_timeout_ms, clampedTimeout(min_dial_timeout_ms, &spy));
+    try std.testing.expectEqual(max_dial_timeout_ms, clampedTimeout(max_dial_timeout_ms, &spy));
+    try std.testing.expectEqual(min_dial_attempts, clampedAttempts(min_dial_attempts, &spy));
+    try std.testing.expectEqual(max_dial_attempts, clampedAttempts(max_dial_attempts, &spy));
+    try std.testing.expectEqual(@as(usize, 0), spy.n);
+}
+
+test "M35: FreedomConfig.build 把拨号参数带到 Built" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var spy = WarnSpy{};
+    const c = FreedomConfig{
+        .finalRules = &.{.{ .action = "allow" }},
+        .dialTimeoutMs = 8000,
+        .dialAttempts = 5,
+    };
+    const b = try c.build(arena_state.allocator(), &spy);
+    try std.testing.expectEqual(@as(i64, 8000), b.dial_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 5), b.dial_attempts);
+    try std.testing.expectEqual(@as(usize, 1), b.final_rules.len);
 }

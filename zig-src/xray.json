@@ -74,6 +74,7 @@
       "protocol": "freedom",
       "tag": "direct",
       "settings": {
+        "dialTimeoutMs": 8000,
         "finalRules": [
           {
             "action": "allow"

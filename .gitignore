@@ -72,6 +72,7 @@ ehthumbs.db
 .temp/
 # 代理工作区数据（会话/记忆，非交付物）
 .workbuddy-ai/
+.workbuddy/
 # zig 构建缓存（本地 664M）
 zig-src/.zig-cache/
 # 构建产物（部署件在设备/打包机，md5 记录于 PROGRESS.md；重建约 1 分钟，见交付说明）

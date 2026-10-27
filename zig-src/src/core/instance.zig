@@ -71,7 +71,13 @@ pub const Instance = struct {
         // 出站：默认出站 = outbounds 顺序第一个（表 4-1；conf 层保证非空）
         if (cfg.outbounds.len > 0) {
             const ob = &cfg.outbounds[cfg.default_outbound];
-            self.freedom_handler = .{ .logger = logger, .pool = &self.pool, .rules = ob.freedom_rules };
+            self.freedom_handler = .{
+                .logger = logger,
+                .pool = &self.pool,
+                .rules = ob.freedom_rules,
+                .dial_timeout_ms = ob.dial_timeout_ms,
+                .dial_attempts = ob.dial_attempts,
+            };
             self.outbounds_storage[0] = .{ .tag = ob.tag, .protocol = ob.protocol, .freedom = &self.freedom_handler };
             self.dispatcher = .{ .logger = logger, .outbounds = .{ .handlers = self.outbounds_storage[0..] }, .stats = self.stats_manager, .policy = cfg.policy };
             self.has_outbound = true;

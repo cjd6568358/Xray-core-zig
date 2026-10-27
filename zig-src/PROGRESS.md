@@ -1,6 +1,9 @@
 # Xray-core Zig 版实施进度存档
 
-> 更新时间：2026-10-27（M34：连接生命周期打点日志并已上机；**线上 M34** md5 da26b519。178 passed/1 skipped，WS+VLESS / KCP+VMess / mux 三链路设备实测通过；已提交 `105187f2` 并推送 origin/main）
+> 更新时间：2026-10-28（**线上 M35** md5 `5d66f64d`。185 passed/1 skipped。
+> M34 = 连接生命周期打点日志（已上机，提交 `105187f2`）；
+> M35 = 基于该打点做生产分析，新增 `dialTimeoutMs` 可调拨号参数 + 进程内 DNS 缓存，
+> 不可达目标失败耗时 81s→41.2s；手机端零改动。详见 `zig-src/M35-打点分析与定向优化.md`）
 > 新会话接手：先读本文件 + `zig-src/交付说明.md`（部署/复跑/偏差/排障）+ `zig-src/Xray-Zig版开发设计文档.html`（v1.1）+ `zig-src/设计文档评审报告.md`
 
 ## 一、任务与总纲
@@ -1180,6 +1183,61 @@ M12/M28 的排障日志（`connection closed` / `mux session opened|closed` / `k
   （也因此**没有改动仓库 `xray.json`**，保持与设备一致）。
 - 仓库 `xray.json` 与设备配置本次均未修改；客户端侧零影响。
 
+## M35：光猫生产打点分析 + 拨号/DNS 定向优化（已上机）
+
+> 完整分析、验证与回滚方法见 `zig-src/M35-打点分析与定向优化.md`。
+> 本节是索引卡，避免后人从 PROGRESS 里看不出改动全貌。
+
+### 起因
+用户要求"分析打点日志，定向优化客户端连接"。取设备现役进程日志
+（窗口 2026-10-27 10:25→18:52，8.45h；顶层连接 2312 条 + mux 子会话 259 条）做连接级分解。
+
+### 分析结论（判据都来自 `trace conn=` 打点，口径见报告 §0）
+- **服务端不是瓶颈**：`hdr_wait_ms` 与 `hdr_parse_ms` 均 avg 0.0ms；`overload=0`；
+  进程 Threads 4 / RSS 5.9MB。CPU 侧改什么都测不出收益。
+- TTFB 200ms 分解：**WS 握手 67.1ms(33.6%) / 出站拨号 76.1ms(38.0%) / 目标响应 56.8ms(28.4%)**，
+  服务端两段 0.0ms。`ws_ms` 严重双峰（p50=9ms → p99=1988ms）= 客户端侧链路问题，服务端碰不到。
+- **最大浪费**：149 条 `dial_fail` 拨号耗时 p50=**81218ms**，
+  = `dial_timeout_ms 16s × dial_attempts 5 + 退避 1s`，逐毫秒吻合；
+  全部落在出口不可达目标（Google 系 111 + 测速节点 32），合计 ~3.35h 槽位空转。
+
+### 两处改动（均在出站侧，**手机端零改动**）
+1. **`dialTimeoutMs` / `dialAttempts` 新增为配置项**（conf/freedom.zig）
+   —— **默认值保持上游原样**，不配 = 零行为变更；越界/0 静默回落默认并告警（刻意不做成启动失败路径）。
+   透传链：`RuntimeOutbound`（conf/config.zig）→ `instance.zig` Handler 装配 → `dialWithRetry`。
+2. **进程内 DNS 缓存**（common/sock.zig）：128 条 / 主机≤96B / TTL 60s / `dnsInvalidate` 兜底。
+   动因：域名目标比 IP 字面量目标慢得多（p50 18 vs 6ms，**p95 309 vs 32ms**），
+   且 `resolveTarget` 在重试循环内 ⇒ 一次失败拨号重复解析 5 次。
+
+### 关键决策（反向证据，勿重复踩）
+- **不能砍 `dial_attempts`**：成功拨号 `max=79806ms` 几乎贴满 81s 预算 ⇒ 确有连接靠**第 5 次**
+  尝试才成功。砍到 3 会把 1.74%（>5s 的 37 条）从"慢成功"扭成"失败"。
+- **缩单次超时安全**：不减次数，只让每次更快轮到下一次，故 16s→8s。实测 81s → **41.2s**。
+- **DNS 缓存不可在 getaddrinfo 期间持锁**（p95 309ms，持锁会把所有待解析连接串行化）。
+  采用「加锁查表 → 不持锁解析 → 加锁回填」三段式。
+- ⚠ **初版报告的方案作废**：曾写"把 Google 域名配进 `finalRules` 的 block"，
+  核对 `conf/freedom.zig:27-33` 后确认 `FinalRule` 只有 `action/network/port/ip(CIDR)`，
+  **没有域名字段**，不可实现。
+
+### 验证
+- 打包机 10.0.0.4 真实执行：**185 passed / 1 skipped / 0 failed**（新增 7 个用例全过）。
+  ⚠ 本机 Windows 只能 `--test-no-exec`，**必须到打包机真跑**才算数。
+- 产物 **824784B / md5 `5d66f64da8717fd30c22eaa9d0fdff64`**（M34 为 820688B / da26b519）。
+- 客户端连通性 5 项全过（含**全链路拿到 SSH 横幅**）→ 手机端无需任何改动。
+- 不可达拨号失败耗时 **81s → 41.2s**（RFC5737 `192.0.2.1` 实测；服务端 `dur_max_ms=41227` 自证）。
+
+### 待观察（不宣称已达成）
+- **DNS 缓存收益未证实**：同域名三次 `dial_ms` 40/38/36ms vs 历史 43ms，
+  幅度落在噪声内。需观察 1~2 天后用「域名 vs IP 目标」全量口径重算。
+- 下行读合并（报告 §5/P2）本轮未做：会引入延迟，需"仅连续小包时合并"的自适应
+  策略 + 完整 soak 验证，不能无条件开。
+- 客户端启用 mux（报告 §6/P1）未做：收益最大但**要动手机配置**，需用户先确认。
+
+### 部署/回滚
+- 线上 `/opt/armbian/bin/xray/xrayz` = md5 `5d66f64d…`，pid 16534。
+- 回滚件在设备：`xrayz.bak.m34`（M34 旧件 `da26b519…`）、`xray.json.bak.m34`（旧配置 1696B）。
+- 仓库 `zig-src/xray.json` 已同步加 `"dialTimeoutMs": 8000`，与设备**逐字节相同**（维持 M32 三处一致）。
+
 ## 六、下一步（接手即做）
 
 1. ~~M7 VMess 入站~~ / ~~M8 测试移植 + Go 互通~~ / ~~M9 VMess+KCP 互通~~ / ~~M10 丢包回归~~ / ~~M17 UDP 代理命令~~ / ~~M19 UDP 底座真因~~ / ~~M20 XUDP over mux~~（均已完成）
@@ -1195,8 +1253,8 @@ M12/M28 的排障日志（`connection closed` / `mux session opened|closed` / `k
 
 ## 七、当前仓库状态
 
-- 测试：**178 passed / 1 skipped / 0 failed，零泄漏**（x86_64-linux-musl；M34 在打包机复跑确认；
-  M33 时 166，M34 新增 12 条 = 打点 11 + TraceLevel 1）
+- 测试：**185 passed / 1 skipped / 0 failed，零泄漏**（x86_64-linux-musl；**M35 在打包机真实执行确认**；
+  M33 时 166，M34 新增 12 条 = 打点 11 + TraceLevel 1，M35 新增 7 条 = 拨号配置 5 + DNS 缓存 2）
 - 互通：`tests/interop/interop_smoke.py` I1–I5 全过（Go xray 26.10.21 客户端 ↔ Zig 服务端；I4 = 生产链路 VMess+KCP + 1MiB sha256；I5 = mux 10/10）
 - XUDP：`tools/xudp_smoke.py` **19/19**（单连接 8 包对拍 / 多轮建链 / SIGKILL 强杀线程回落 / 6 路并发会话强杀）
 - 丢包/弱网（M33 打包机复跑，2026-10-26）：`tools/kcp_loss.py`（mKCP 19002）**0/5/10% 全 PASS**；
@@ -1206,11 +1264,12 @@ M12/M28 的排障日志（`connection closed` / `mux session opened|closed` / `k
   故"四档全过"的旧表述已订正为"0/5/10% 稳定通过，20% 与上游同水平抖动"。
   `tools/ws_weaknet.py`（WS 19001）**0/5/10/20% + 乱序全过**，1MiB 各 3/3；
   弱网 1MiB 中位数：0% 0.64s / 5% 0.83s / 10% 2.88s / 20% 3.83s（M23 的 3.70s vs Go 4.41s 为另一台机口径，勿混用）
-- 产物：`zig-src/dist/xrayz-aarch64-musl`（**M34**，820688B ReleaseSafe+strip，md5 **da26b51977f192a6bdb6e7dd228e2b76**，已与设备现役件同 md5；
-  M33 为 797520B / 808666d8）
+- 产物：`zig-src/dist/xrayz-aarch64-musl`（**M35**，824784B ReleaseSafe+strip，md5 **5d66f64da8717fd30c22eaa9d0fdff64**，已与设备现役件同 md5；
+  M34 为 820688B / da26b519，M33 为 797520B / 808666d8）
 - 交付文档：`zig-src/交付说明.md`（部署/回滚/复跑/偏差/Phase 2/排障）
-- **线上实例（M34）**：`/opt/armbian/bin/xray/xrayz` md5 `da26b51977f192a6bdb6e7dd228e2b76`（820688B），
-  2026-10-27 10:24:55 CST cutover，pid 随重启变化（当次 6993）；info 日志 + access 落 `/tmp/xrayz*.log`，
+- **线上实例（M35）**：`/opt/armbian/bin/xray/xrayz` md5 `5d66f64da8717fd30c22eaa9d0fdff64`（824784B），
+  2026-10-28 00:15 CST cutover（M35），pid 随重启变化（当次 16534）；设备侧回滚件
+  `xrayz.bak.m34`（M34 旧件 `da26b519…`）+ `xray.json.bak.m34` 均在位。info 日志 + access 落 `/tmp/xrayz*.log`，
   **M34 起日志内另有每连接 `trace conn=` 行与每 60s `trace_stats` 行**；**开机自启已接入**（`/opt/script/xray_start.sh` Zig 优先 + Go 回退）；**M29 备份清理（用户要求"只留一份 go 原版和 zig 版本"）**：已删 `xrayz.m23.bak`(3719ac05) / `xrayz.m26.bak`(e8d1d2b4) / `xrayz.m27.bak`(b83e948f) / `xrayz-start.sh.bak.m22`(4a82917d) / `xray.json.bak.20261023b`(b27743e0)——目录现只含 `xray`（Go 原版/回退件）/ `xrayz`（M34 现役）/ `xray.json` / `xrayz-start.sh` / `soak_report.py`。**回滚路径变更**：不再有 .bak 一键回滚，需回滚时从源码重建（打包机约 1 分钟）或重新部署历史产物（M34 当次的临时回滚件 `/tmp/xrayz.m33.bak` 在 tmpfs，重启即失效）
 - Mux 服务端 + XUDP + 统计 + VLESS fallbacks 均已上机；**Mux 客户端（出站）未实现**——Phase 2 如需 Zig 当客户端再排
 - 实机 smoke：WS T1-T5 + VLESS T1-T2 + KCP T1-T3 + VMess T1-T4 + XUDP（DNS 5/5 + TCP over mux 10/10）+ selfcheck，均通过；

@@ -413,6 +413,105 @@ pub fn resolveV4(arena: std.mem.Allocator, host: []const u8) ?[4]u8 {
     return null;
 }
 
+// ============================ M35：进程内 DNS 缓存 ============================
+//
+// 【动因】光猫 本次观察窗口（8.45h / 2312 连接）实测：域名目标的出站拨号比 IP 字面量
+// 目标慢一截，且尾巴很重 ——
+//     IP 字面量（无 DNS）：p50=6ms   p90=25ms  p95=32ms
+//     域名（需 DNS）    ：p50=18ms  p90=49ms  p95=309ms
+// 差出来的部分就是 musl getaddrinfo 的出网往返。更糟的是 `dialWithRetry` 把
+// resolveTarget 放在重试循环内部，一条失败连接会重复解析 5 次。
+//
+// 【TTL 为什么取 60s】缓存期限必须不高于典型 DNS TTL，否则 CDN 换 IP 后会持续
+// 连到已下线的地址。60s 足够吃到绝大多数"同域名短时间重复连接"的收益（本窗口
+// 274 连接/小时，头部域名几分钟内必然复现），又把陈旧窗口压到一分钟以内。
+// 另有兜底：整条拨号彻底失败时 freedom 会调 dnsInvalidate 主动失效该域名。
+//
+// 【并发要点】getaddrinfo 是阻塞的（实测 p95 达 309ms）。**绝不能在持锁时长阻塞**，
+// 否则会把所有需要解析的连接串行化，性能反而比不缓存更差。故采用三段式：
+//     ① 加锁查表（线性扫描，微秒级）→ 命中即解锁返回
+//     ② **不持锁**做 getaddrinfo
+//     ③ 加锁回填
+// 代价是缺"缓存击穿保护"（同一域名并发首次解析会各查一次），可接受。
+
+pub const dns_max_entries = 128;
+pub const dns_max_host_len = 96;
+/// 缓存期限毫秒。置 0 可整体关闭缓存。
+pub var dns_cache_ttl_ms: i64 = 60 * 1000;
+
+const DnsEntry = struct {
+    host_len: u8 = 0,
+    ip: [4]u8 = .{ 0, 0, 0, 0 },
+    expire_ms: i64 = 0,
+    host: [dns_max_host_len]u8 = undefined,
+};
+
+var dns_entries: [dns_max_entries]DnsEntry = std.mem.zeroes([dns_max_entries]DnsEntry);
+var dns_len: usize = 0;
+var dns_mu: sys.Mutex = .{};
+
+fn dnsLookup(host: []const u8, now: i64) ?[4]u8 {
+    if (host.len == 0 or host.len > dns_max_host_len) return null; // 防御：入口若不校验也不致越界
+    dns_mu.lock();
+    defer dns_mu.unlock();
+    for (dns_entries[0..dns_len]) |*e| {
+        if (e.host_len != host.len) continue;
+        if (!std.mem.eql(u8, e.host[0..e.host_len], host)) continue;
+        if (now >= e.expire_ms) return null; // 过期命中按未命中处理
+        var out: [4]u8 = undefined;
+        @memcpy(&out, &e.ip);
+        return out;
+    }
+    return null;
+}
+
+fn dnsInsert(host: []const u8, ip: [4]u8, now: i64) void {
+    if (host.len == 0 or host.len > dns_max_host_len) return; // 同上：杜绝 host 缓冲越界
+    dns_mu.lock();
+    defer dns_mu.unlock();
+    // 已存在则刷新（并发重复解析时后者覆盖前者，值等价，无需判先后）
+    for (dns_entries[0..dns_len]) |*e| {
+        if (e.host_len == host.len and std.mem.eql(u8, e.host[0..e.host_len], host)) {
+            @memcpy(&e.ip, &ip);
+            e.expire_ms = now + dns_cache_ttl_ms;
+            return;
+        }
+    }
+    if (dns_len >= dns_max_entries) return; // 满了：不逐出，直接放弃（保守，避免引入逐出策略的不确定性）
+    const e = &dns_entries[dns_len];
+    e.host_len = @intCast(host.len);
+    @memcpy(e.host[0..host.len], host);
+    @memcpy(&e.ip, &ip);
+    e.expire_ms = now + dns_cache_ttl_ms;
+    dns_len += 1;
+}
+
+/// 让某个域名的缓存立即失效（拨号彻底失败时由 freedom 调用，避免 CDN 换 IP 后
+/// 一直连已下线地址）。不存在该条目时无操作。
+pub fn dnsInvalidate(host: []const u8) void {
+    if (host.len == 0 or host.len > dns_max_host_len) return;
+    dns_mu.lock();
+    defer dns_mu.unlock();
+    for (dns_entries[0..dns_len]) |*e| {
+        if (e.host_len == host.len and std.mem.eql(u8, e.host[0..e.host_len], host)) {
+            e.expire_ms = 0;
+            return;
+        }
+    }
+}
+
+/// 带进程内缓存的域名解析。语义与 `resolveV4` 完全一致（仅取首条 A 记录），
+/// 差别仅在 TTL 窗口内复用上次结果。TTL<=0 时退化为原 `resolveV4`。
+pub fn resolveV4Cached(arena: std.mem.Allocator, host: []const u8) ?[4]u8 {
+    if (dns_cache_ttl_ms <= 0 or host.len == 0 or host.len > dns_max_host_len) {
+        return resolveV4(arena, host);
+    }
+    if (dnsLookup(host, sys.nowMonoMs())) |ip| return ip;
+    const ip = resolveV4(arena, host) orelse return null; // ② 不持锁的慢调用
+    dnsInsert(host, ip, sys.nowMonoMs());
+    return ip;
+}
+
 // ============================ SIGPIPE ============================
 
 /// 进程启动时屏蔽 SIGPIPE（Go 运行时原生行为；Zig 需自行设置，防写对端关闭即死）
@@ -452,4 +551,93 @@ test "sock: accept/dial 均关闭 Nagle（对齐 Go net.TCPConn 默认）" {
     len = @sizeOf(c_int);
     _ = linux.getsockopt(c.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&v), &len);
     try std.testing.expectEqual(@as(c_int, 1), v); // 出站 dial 侧
+}
+
+// ============================ M35：DNS 缓存表 ============================
+//
+// 刻意合并成**一个**用例：缓存表是模块级全局，Zig 测试执行顺序/并发度不受控，
+// 拆成多个用例会互相踩条目。本用例自带首尾复位，故与顺序无关。
+
+test "M35: DNS 缓存表（命中/过期/刷新/失效/容量上界/超长名）" {
+    const orig_ttl = dns_cache_ttl_ms;
+    defer dns_cache_ttl_ms = orig_ttl; // 不污染其它用例
+    dns_cache_ttl_ms = 60 * 1000;
+
+    const reset = struct {
+        fn r() void {
+            dns_mu.lock();
+            defer dns_mu.unlock();
+            dns_len = 0;
+            for (&dns_entries) |*e| {
+                e.host_len = 0;
+                e.expire_ms = 0;
+            }
+        }
+    }.r;
+    reset();
+    defer reset();
+
+    const now: i64 = 1_000_000;
+    const ip1 = [4]u8{ 1, 2, 3, 4 };
+    const ip2 = [4]u8{ 5, 6, 7, 8 };
+
+    // 冷表必然未命中
+    try std.testing.expectEqual(@as(?[4]u8, null), dnsLookup("a.example.com", now));
+
+    // 命中 + TTL 边界（到期整点按未命中）
+    dnsInsert("a.example.com", ip1, now);
+    try std.testing.expectEqual(ip1, dnsLookup("a.example.com", now).?);
+    try std.testing.expectEqual(ip1, dnsLookup("a.example.com", now + dns_cache_ttl_ms - 1).?);
+    try std.testing.expectEqual(@as(?[4]u8, null), dnsLookup("a.example.com", now + dns_cache_ttl_ms));
+
+    // 同域名重复插入 = 刷新（不是新增一条）
+    dnsInsert("a.example.com", ip2, now);
+    try std.testing.expectEqual(ip2, dnsLookup("a.example.com", now).?);
+    try std.testing.expectEqual(@as(usize, 1), dns_len);
+
+    // 不同域名互不干扰
+    dnsInsert("b.example.com", ip1, now);
+    try std.testing.expectEqual(ip2, dnsLookup("a.example.com", now).?);
+    try std.testing.expectEqual(ip1, dnsLookup("b.example.com", now).?);
+
+    // 主动失效（CDN 换 IP 场景的兜底）
+    dnsInvalidate("a.example.com");
+    try std.testing.expectEqual(@as(?[4]u8, null), dnsLookup("a.example.com", now));
+    try std.testing.expectEqual(ip1, dnsLookup("b.example.com", now).?); // 只失效指定域名
+
+    // 失效不存在的域名 = 无操作，不许 panic
+    dnsInvalidate("nope.example.com");
+    dnsInvalidate("");
+
+    // 超长主机名：既不入库也不越界
+    var long_buf: [dns_max_host_len + 1]u8 = undefined;
+    @memset(&long_buf, 'x');
+    const long: []const u8 = &long_buf;
+    dnsInvalidate(long);
+    try std.testing.expectEqual(@as(?[4]u8, null), dnsLookup(long, now));
+    try std.testing.expectEqual(@as(usize, 2), dns_len); // 未新增条目
+
+    // 容量上界：灌到超过容量后长度封顶，先入库的仍可命中
+    reset();
+    var i: usize = 0;
+    while (i < dns_max_entries + 20) : (i += 1) {
+        var hb: [64]u8 = undefined;
+        const h = std.fmt.bufPrint(&hb, "h{d}.test", .{i}) catch break;
+        dnsInsert(h, ip1, now);
+    }
+    try std.testing.expectEqual(dns_max_entries, dns_len);
+    try std.testing.expectEqual(ip1, dnsLookup("h0.test", now).?);
+    // 超出容量后被放弃的那条不可命中（未逐出语义的反向验证）
+    var hb2: [64]u8 = undefined;
+    const overflowed = std.fmt.bufPrint(&hb2, "h{d}.test", .{dns_max_entries}) catch unreachable;
+    try std.testing.expectEqual(@as(?[4]u8, null), dnsLookup(overflowed, now));
+}
+
+test "M35: TTL<=0 时缓存整体关闭（等价于原 resolveV4 路径）" {
+    const orig = dns_cache_ttl_ms;
+    defer dns_cache_ttl_ms = orig;
+    dns_cache_ttl_ms = 0;
+    // 关闭状态下查表必须恒空 —— 保证"关掉缓存"是条可达的退路
+    try std.testing.expectEqual(@as(?[4]u8, null), dnsLookup("anything.local", sys.nowMonoMs()));
+    dnsInsert("anything.local", [4]u8{ 9, 9, 9, 9 }, sys.nowMonoMs());
 }
